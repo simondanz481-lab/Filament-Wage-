@@ -1,0 +1,5216 @@
+struct BambuFilamentSlot; // Vorabdeklaration fuer Arduino-Autoprototypen
+
+
+/*
+  FILAMENTWAAGE V1.0.0 (Hybridmessung, Meldungen, Statistik, Backup, farbige Popups)
+
+  Hardware: Hosyond ESP32-32E
+  Display: ST7796, 480 x 320
+  Touch: XPT2046
+  HX711: DOUT GPIO32, SCK GPIO25
+
+  - 16-Bit-Sprite (RGB565)
+  - Keine gruenen Balken auf der Waagenseite
+  - Farbfeld, Farbname und RGB-Wert
+  - Keine ungewollte Nullstellung beim Erststart
+  - Bambu Cloud MQTT
+  - Druckstatus, Fortschritt und Restzeit
+  - Druckverbrauch und Druckarchiv
+  - CSV-Export und Diagnosekonsole
+  - 8 Filamentprofile
+  - RGB-Auswahl mit Speichern
+  - WLAN, Webserver und Login
+  - Nullpunkt und Faktor -365.0
+  - Filament-reicht-Pruefung
+
+  Bibliotheken:
+  LovyanGFX, HX711, ArduinoJson 7, PubSubClient
+*/
+
+// =====================================================
+// 1. ZUGANGSDATEN
+// =====================================================
+
+const char* WIFI_SSID = "";
+const char* WIFI_PASS = "";
+
+const char* BAMBU_SN = "";
+const char* BAMBU_TOKEN = "";
+const char* BAMBU_UID = "";
+
+const char* WEB_USER = "";
+const char* WEB_PASS = "";
+
+// =====================================================
+// 2. BIBLIOTHEKEN UND PINS
+// =====================================================
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <HX711.h>
+#include <LovyanGFX.hpp>
+#include <time.h>
+#include <math.h>
+#include <ctype.h>
+
+// V1.8: Ereignisse haben getrennte LCD- und Browser-Kanaele.
+enum NoticeType : uint8_t {
+  N_LOW, N_START, N_END, N_FAILED, N_MOTION, N_LOST, N_RESTORED, N_PAUSE,
+  N_COUNT
+};
+void emitNotice(NoticeType type, const String &message);
+void updateHybrid(float rawGrams, float windowSpan);
+void serviceHybridFinal();
+void monitorLowFilament();
+void monitorConnections();
+void saveV18Settings();
+
+struct BambuFilamentSlot {
+  String material;
+  uint32_t color = 0xAAAAAA;
+  bool colorKnown = false;
+  bool received = false;
+};
+
+// Explizite Prototypen und Struktur VOR den ersten Funktionen
+// (verhindert Arduinos automatische Deklaration vor dem Struct).
+void takeBambuTray(JsonVariantConst data, BambuFilamentSlot& slot);
+String slotMaterial(const BambuFilamentSlot& slot);
+
+
+#define HX_DT 32
+#define HX_SCK 25
+
+#define TFT_SCLK 14
+#define TFT_MOSI 13
+#define TFT_MISO 12
+#define TFT_CS 15
+#define TFT_DC 2
+#define TFT_LED 27
+#define TOUCH_CS 33
+
+const float SCALE_FACTOR = -405.1f;
+
+// =====================================================
+// 3. DISPLAY
+// =====================================================
+
+class LGFX : public lgfx::LGFX_Device {
+  lgfx::Panel_ST7796 panel;
+  lgfx::Bus_SPI bus;
+  lgfx::Touch_XPT2046 touch;
+
+public:
+  LGFX() {
+    {
+      auto c = bus.config();
+      c.spi_host = SPI2_HOST;
+      c.spi_mode = 0;
+      c.freq_write = 27000000;
+      c.freq_read = 12000000;
+      c.spi_3wire = false;
+      c.use_lock = true;
+      c.dma_channel = 0;
+      c.pin_sclk = TFT_SCLK;
+      c.pin_mosi = TFT_MOSI;
+      c.pin_miso = TFT_MISO;
+      c.pin_dc = TFT_DC;
+      bus.config(c);
+      panel.setBus(&bus);
+    }
+
+    {
+      auto c = panel.config();
+      c.pin_cs = TFT_CS;
+      c.pin_rst = -1;
+      c.pin_busy = -1;
+      c.memory_width = 320;
+      c.memory_height = 480;
+      c.panel_width = 320;
+      c.panel_height = 480;
+      c.offset_x = 0;
+      c.offset_y = 0;
+      c.offset_rotation = 0;
+      c.readable = false;
+      c.invert = false;
+      c.rgb_order = false;
+      c.bus_shared = true;
+      panel.config(c);
+    }
+
+    {
+      auto c = touch.config();
+      c.spi_host = SPI2_HOST;
+      c.freq = 1000000;
+      c.bus_shared = true;
+      c.pin_sclk = TFT_SCLK;
+      c.pin_mosi = TFT_MOSI;
+      c.pin_miso = TFT_MISO;
+      c.pin_cs = TOUCH_CS;
+      c.pin_int = -1;
+      c.x_min = 200;
+      c.x_max = 3800;
+      c.y_min = 3900;
+      c.y_max = 300;
+      touch.config(c);
+      panel.setTouch(&touch);
+    }
+
+    setPanel(&panel);
+  }
+};
+
+LGFX lcd;
+LGFX_Sprite sprite(&lcd);
+bool spriteReady = false;
+
+// =====================================================
+// 4. FARBEN UND OBJEKTE
+// =====================================================
+
+// Verstellbar: Dunkelmodus und heller Modus werden zur Laufzeit umgeschaltet.
+uint16_t BG = 0x0862;
+uint16_t CARD = 0x1925;
+uint16_t CARD2 = 0x2945;
+uint16_t WHITE = 0xFFFF;
+uint16_t GRAY = 0xBDF7;
+uint16_t GREEN = 0x3666;
+uint16_t BLUE = 0x2C9F;
+uint16_t RED = 0xF986;
+uint16_t YELLOW = 0xFE20;
+
+const uint32_t PALETTE[] = {
+  0xFF3B30, 0xFF9500, 0xFFCC00,
+  0x30D158, 0x00C7BE, 0x0A84FF,
+  0x5E5CE6, 0xBF5AF2, 0xFFFFFF,
+  0xAAAAAA, 0x222222, 0xFF69B4
+};
+
+const int PALETTE_COUNT = 12;
+
+HX711 scale;
+Preferences prefs;
+WebServer server(80);
+WiFiClientSecure tls;
+PubSubClient mqtt(tls);
+
+// =====================================================
+// 5. PROFILE
+// =====================================================
+
+const int MAX_PROFILES = 8;
+
+struct FilamentProfile {
+  String name;
+  String material;
+  float emptyWeight;
+  float fullWeight;
+  uint32_t rgb;
+  float priceKg; // EUR/kg; 0 = nicht hinterlegt
+};
+
+FilamentProfile profiles[MAX_PROFILES];
+int profileCount = 0;
+int activeProfile = 0;
+
+FilamentProfile& active() {
+  return profiles[activeProfile];
+}
+
+// =====================================================
+// 6. DRUCKARCHIV
+// =====================================================
+
+const int MAX_HISTORY = 12;
+
+struct PrintRecord {
+  String date;
+  String name;
+  String filament;
+  float used;
+  float startWeight;
+  float endWeight;
+  uint32_t seconds;
+  float cost;        // EUR bei Druckbeginn eingefrorener Filamentpreis
+  bool confirmed;    // echte stabile Endmessung vs. vorlaeufig
+};
+
+PrintRecord historyItems[MAX_HISTORY];
+int historyCount = 0;
+
+// =====================================================
+// 7. WAAGE
+// =====================================================
+
+long zeroOffset = 0;
+long rawValue = 0;
+
+bool zeroValid = false;
+bool hxReady = false;
+bool filterReady = false;
+bool stable = false;
+
+float weightGrams = 0;
+float filteredWeight = 0;
+float lastStableWeight = 0;
+float restGrams = 0;
+float fillPercent = 0;
+// V1.8 Zusatz: globaler, dauerhaft gespeicherter Gewichtsabzug (Browser).
+// Die Messwerte des HX711 und die Hybrid-Druckmessung bleiben unveraendert.
+float manualDeductionGrams = 0.0f;
+
+float recent[8] = {0};
+int recentCount = 0;
+int recentIndex = 0;
+
+unsigned long lastScaleAt = 0;
+unsigned long lastScaleOK = 0;
+unsigned long lastStableAt = 0; // nur zeitnah stabile Startwerte verwenden
+
+// =====================================================
+// 8. WLAN UND BAMBU
+// =====================================================
+
+bool wifiWasConnected = false;
+
+unsigned long lastWifiAttempt = 0;
+unsigned long lastMQTTAttempt = 0;
+unsigned long lastBambuMessage = 0;
+
+bool bambuConnected = false;
+bool bambuStateKnown = false;
+
+String bambuState = "OFFLINE";
+String bambuJob = "";
+
+int bambuProgress = 0;
+int bambuRemaining = -1;
+
+// =====================================================
+// 9. DRUCKMESSUNG
+// =====================================================
+
+bool printActive = false;
+bool printAutomatic = false;
+
+String printName = "";
+
+float printStartWeight = 0;
+float printUsed = 0;
+float expectedGrams = 0;
+
+unsigned long printStartMillis = 0;
+unsigned long printDuration = 0;
+// Hybridmessung: bestehende Gewichtsermittlung bleibt unveraendert.
+float hybridProvisional = 0;
+float hybridLastRaw = NAN;
+float printPriceKg = 0;
+String printFilamentLabel;
+bool printStartStable = false;
+bool printEndedFailed = false;
+bool hybridMajorDisturbance = false;
+bool hybridDisturbed = false;
+uint8_t hybridGoodSamples = 0;
+unsigned long hybridDisturbedUntil = 0;
+unsigned long hybridLastValidAt = 0;
+bool printEndPending = false;
+unsigned long printEndRequestedAt = 0;
+unsigned long printEndQuietSince = 0;
+bool lastPrintConfirmed = false;
+bool warnedLow = false;
+float lowFilamentThreshold = 100.0f;
+// Bei ausstehender Endmessung wird kein zweiter Druck begonnen.
+
+
+// =====================================================
+// 10. TOUCH UND DIAGNOSE
+// =====================================================
+
+enum Page {
+  PAGE_SCALE,
+  PAGE_PROFILE,
+  PAGE_PRINT,
+  PAGE_BAMBU,
+  PAGE_SYSTEM,
+  PAGE_COLOR,
+  PAGE_BAMBU_OPTIONS,
+  PAGE_DISPLAY_SETTINGS,
+  PAGE_SYSTEM_DETAILS,
+  PAGE_RESTART_CONFIRM,
+  PAGE_PRINT_ARCHIVE,
+  PAGE_THEME_COLORS,
+  PAGE_NOTIFICATIONS,
+  PAGE_STATS
+};
+
+Page currentPage = PAGE_SCALE;
+
+bool pageDirty = true;
+bool touchDown = false;
+
+unsigned long lastTouch = 0;
+unsigned long lastDraw = 0;
+
+String previousSignature = "";
+
+uint32_t temporaryColor = 0x21C5FF;
+
+// V1.6: Welche Spulen im BAMBU-Menue angezeigt werden?
+// 0: AMS Lite, 1: externe Spule, 2: beides
+uint8_t bambuViewMode = 2;
+uint8_t pendingBambuViewMode = 2;
+
+// V1.6: Display-Einstellungen (separat bestaetigen/speichern)
+uint8_t displayBrightness = 88;
+uint8_t pendingBrightness = 88;
+uint8_t displayTimeoutChoice = 2; // 0=nie, 1=1min, 2=5min, 3=10min, 4=30min
+uint8_t pendingTimeoutChoice = 2;
+bool displayDarkMode = true;
+bool pendingDarkMode = true;
+bool displayNotifications = true;
+bool pendingNotifications = true;
+const uint16_t DISPLAY_TIMEOUT_MINUTES[] = {0, 1, 5, 10, 30};
+bool displayAwake = true;
+unsigned long lastDisplayInteraction = 0;
+String displayNotice = "";
+unsigned long displayNoticeUntil = 0;
+// V1.8 Popups: typabhaengige Farben, kein Eingriff in Kalibrierung / Menues.
+NoticeType displayNoticeType = N_START;
+// Popup einmalig zeichnen und bis zum Schliessen unveraendert lassen.
+// So kann die 300-ms-Aktualisierung der Waage keine Box mehr uebermalen.
+bool noticePopupDrawn = false;
+const int NOTICE_BOX_X = 28;
+const int NOTICE_BOX_Y = 84;
+const int NOTICE_BOX_W = 424;
+const int NOTICE_BOX_H = 144;
+// Das bisherige globale LCD-Benachrichtigungsflag bleibt erhalten.
+// Selektive Kanalmasken (ein Bit je Ereignis), im selben NVS-Namespace.
+uint16_t noticeDisplayMask = 0xFF;
+uint16_t noticeWebMask = 0xFF;
+uint16_t pendingNoticeDisplayMask = 0xFF;
+uint16_t pendingNoticeWebMask = 0xFF;
+uint8_t noticePage = 0;
+struct NoticeRecord {
+  uint32_t id;
+  NoticeType type;
+  String message;
+  String date;
+};
+const uint8_t MAX_NOTICES = 14;
+NoticeRecord noticeRecords[MAX_NOTICES];
+uint8_t noticeCount = 0;
+uint32_t noticeSequence = 0;
+bool everBambuConnected = false;
+bool bambuLinkWasDown = false;
+bool mqttStaleReported = false;
+
+uint8_t systemDetailsType = 0; // WLAN=0, Zugang=1, Speicher=2, Info=3
+int printArchiveOffset = 0; // Vier Eintraege je Touch-Seite
+
+// V1.7: individuelle Display-Farben (24-bit RGB), dauerhaft im NVS.
+bool customColorsEnabled = false;
+bool pendingCustomColors = false;
+uint32_t customBgRgb = 0x080C10UL;
+uint32_t customTextRgb = 0xFFFFFFUL;
+uint32_t pendingBgRgb = 0x080C10UL;
+uint32_t pendingTextRgb = 0xFFFFFFUL;
+uint32_t editBgRgb = 0x080C10UL;
+uint32_t editTextRgb = 0xFFFFFFUL;
+uint8_t themeEditTarget = 0; // 0=Hintergrund, 1=Schrift
+uint8_t themeColorInputMode = 0; // 0=12 Farbvorlagen, 1=HEX-Tastatur
+String themeHexDigits = "";      // 6 Zeichen fuer #RRGGBB
+bool colorContrastWarning = false;
+
+
+// Bambu-Spulenstruktur und Prototypen stehen oben bei den Includes.
+
+BambuFilamentSlot amsSlots[4];
+BambuFilamentSlot externalSlot;
+
+float bambuNozzleTemp = NAN;
+float bambuNozzleTarget = NAN;
+float bambuBedTemp = NAN;
+float bambuBedTarget = NAN;
+int bambuLayer = -1;
+int bambuTotalLayers = -1;
+uint32_t bambuError = 0;
+
+
+const int MAX_LOGS = 24;
+String logLines[MAX_LOGS];
+int logNext = 0;
+
+unsigned long lastSerialStatus = 0;
+
+// =====================================================
+// 11. HILFSFUNKTIONEN
+// =====================================================
+
+float clampFloat(
+  float value,
+  float minimum,
+  float maximum
+) {
+  return max(minimum, min(maximum, value));
+}
+
+// Nur der Anzeigewert wird korrigiert; die Rohmessung bleibt fuer
+// Stabilitaetserkennung und Druckverbrauch unangetastet.
+float displayedWeightGrams() {
+  return max(0.0f, weightGrams - manualDeductionGrams);
+}
+
+void recalculateFilamentRemaining() {
+  restGrams = max(0.0f, displayedWeightGrams() - active().emptyWeight);
+  fillPercent = active().fullWeight > 0
+    ? clampFloat(restGrams / active().fullWeight * 100.0f, 0, 100)
+    : 0;
+}
+
+String escapeHTML(String s) {
+  s.replace("&", "&amp;");
+  s.replace("<", "&lt;");
+  s.replace(">", "&gt;");
+  s.replace("\"", "&quot;");
+  s.replace("'", "&#39;");
+  return s;
+}
+
+String colorHex(uint32_t rgb) {
+  char buffer[8];
+
+  snprintf(
+    buffer,
+    sizeof(buffer),
+    "#%06lX",
+    (unsigned long)(rgb & 0xFFFFFF)
+  );
+
+  return String(buffer);
+}
+
+uint32_t readHexColor(String s) {
+  s.replace("#", "");
+
+  if (s.length() != 6) {
+    return 0x21C5FF;
+  }
+
+  for (char c : s) {
+    if (!isxdigit((unsigned char)c)) {
+      return 0x21C5FF;
+    }
+  }
+
+  return strtoul(s.c_str(), nullptr, 16);
+}
+
+// NEU V1.5: Farbname aus gespeicherter RGB-Farbe
+
+String colorName(uint32_t value) {
+  value &= 0xFFFFFFUL;
+
+  switch (value) {
+    case 0xFF3B30: return "Rot";
+    case 0xFF9500: return "Orange";
+    case 0xFFCC00: return "Gelb";
+    case 0x30D158: return "Gruen";
+    case 0x00C7BE: return "Tuerkis";
+    case 0x0A84FF: return "Blau";
+    case 0x5E5CE6: return "Indigo";
+    case 0xBF5AF2: return "Violett";
+    case 0xFFFFFF: return "Weiss";
+    case 0xAAAAAA: return "Grau";
+    case 0x222222: return "Schwarz";
+    case 0xFF69B4: return "Rosa";
+    case 0x21C5FF: return "Hellblau";
+
+    default:
+      // Bei frei gewaehlten RGB-Farben
+      // den exakten Hexwert anzeigen.
+      return colorHex(value);
+  }
+}
+
+uint16_t rgb565(uint32_t rgb) {
+  return lcd.color565(
+    (rgb >> 16) & 255,
+    (rgb >> 8) & 255,
+    rgb & 255
+  );
+}
+
+// Bambu-Daten koennen in Teilmeldungen eintreffen.
+// Nur empfangene Werte aktualisieren, unbekannte mit -- anzeigen.
+
+bool parseBambuColor(String raw, uint32_t& rgbOut) {
+  raw.trim();
+  if (raw.startsWith("#")) raw.remove(0, 1);
+  if (raw.length() != 6 && raw.length() != 8) return false;
+  for (int i = 0; i < 6; i++) {
+    if (!isxdigit((unsigned char)raw[i])) return false;
+  }
+  rgbOut = strtoul(raw.substring(0, 6).c_str(), nullptr, 16);
+  return true;
+}
+
+void takeBambuTray(JsonVariantConst data, BambuFilamentSlot &slot) {
+  if (data.isNull()) return;
+  slot.received = true;
+  if (!data["tray_type"].isNull())
+    slot.material = data["tray_type"].as<String>();
+  if (!data["tray_color"].isNull()) {
+    String hex = data["tray_color"].as<String>();
+    hex.trim();
+    // RRGGBBAA: 00 Alpha bedeutet unbesetzte/unbekannte Farbe.
+    if (hex.startsWith("#")) hex.remove(0, 1);
+    uint32_t parsed;
+    bool visibleColor = hex.length() == 6 ||
+      (hex.length() == 8 && !hex.endsWith("00"));
+    if (visibleColor && parseBambuColor(hex, parsed)) {
+      slot.color = parsed;
+      slot.colorKnown = true;
+    } else {
+      slot.colorKnown = false;
+      slot.color = 0xAAAAAAUL;
+    }
+  }
+}
+
+String bambuViewName(uint8_t mode) {
+  if (mode == 0) return "AMS Lite";
+  if (mode == 1) return "Externe Spule";
+  return "AMS + Extern";
+}
+
+String temperatureText(float actual, float target) {
+  if (!isfinite(actual)) return "--";
+  String result = String(actual, 0);
+  if (isfinite(target)) result += "/" + String(target, 0);
+  return result;
+}
+
+String slotMaterial(const BambuFilamentSlot &slot) {
+  if (!slot.received || slot.material.isEmpty()) return "--";
+  return slot.material;
+}
+
+void logEvent(String message); // Forward-Deklaration
+
+// =====================================================
+// DISPLAY: Helligkeit, Schlafmodus, hell/dunkel, Hinweise
+// =====================================================
+
+// -----------------------------------------------------
+// V1.7 Farbanpassung: RGB565, Kontrast und Farb-Mischung
+// -----------------------------------------------------
+uint32_t mixRgb(uint32_t from, uint32_t to, uint8_t toPercent) {
+  uint32_t out = 0;
+  for (int shift = 0; shift <= 16; shift += 8) {
+    uint32_t a = (from >> shift) & 255U;
+    uint32_t b = (to >> shift) & 255U;
+    uint32_t ch = (a * (100U - toPercent) + b * toPercent) / 100U;
+    out |= ch << shift;
+  }
+  return out & 0xFFFFFFUL;
+}
+
+float linearRgbChannel(uint8_t raw) {
+  float c = raw / 255.0f;
+  return c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+}
+
+float rgbLuminance(uint32_t rgb) {
+  return 0.2126f * linearRgbChannel((rgb >> 16) & 255) +
+         0.7152f * linearRgbChannel((rgb >> 8) & 255) +
+         0.0722f * linearRgbChannel(rgb & 255);
+}
+
+bool readableColors(uint32_t background, uint32_t foreground) {
+  float b = rgbLuminance(background), t = rgbLuminance(foreground);
+  float hi = max(b, t), lo = min(b, t);
+  // Kleine Schrift auf TFT: mindestens ca. 7:1, auch fuer Karten.
+  return (hi + 0.05f) / (lo + 0.05f) >= 7.0f;
+}
+
+uint32_t defaultBackgroundRgb(bool dark) {
+  return dark ? 0x080C10UL : 0xE2ECF6UL;
+}
+uint32_t defaultTextRgb(bool dark) {
+  return dark ? 0xFFFFFFUL : 0x162F4AUL;
+}
+
+void updatePendingColorDefaults() {
+  if (!pendingCustomColors) {
+    pendingBgRgb = defaultBackgroundRgb(pendingDarkMode);
+    pendingTextRgb = defaultTextRgb(pendingDarkMode);
+  }
+}
+
+uint32_t setColorComponent(uint32_t rgb, uint8_t channel, int delta) {
+  int shift = channel == 0 ? 16 : (channel == 1 ? 8 : 0);
+  int oldValue = (rgb >> shift) & 255;
+  int nextValue = constrain(oldValue + delta, 0, 255);
+  return (rgb & ~(0xFFUL << shift)) | ((uint32_t)nextValue << shift);
+}
+
+void applyDisplayTheme() {
+  if (displayDarkMode) {
+    BG = 0x0862; CARD = 0x1925; CARD2 = 0x2945;
+    WHITE = 0xFFFF; GRAY = 0xBDF7;
+    GREEN = 0x3666; BLUE = 0x2C9F;
+    RED = 0xF986; YELLOW = 0xFE20;
+  } else {
+    BG = lcd.color565(226, 236, 246);
+    CARD = lcd.color565(250, 252, 255);
+    CARD2 = lcd.color565(202, 219, 237);
+    WHITE = lcd.color565(22, 47, 74);
+    GRAY = lcd.color565(80, 104, 130);
+    GREEN = lcd.color565(20, 145, 90);
+    BLUE = lcd.color565(40, 147, 231);
+    RED = lcd.color565(208, 66, 69);
+    YELLOW = lcd.color565(170, 111, 0);
+  }
+  if (customColorsEnabled) {
+    BG = rgb565(customBgRgb);
+    WHITE = rgb565(customTextRgb);
+    // Karten minimal in Richtung Schriftfarbe absetzen.
+    CARD = rgb565(mixRgb(customBgRgb, customTextRgb, 9));
+    CARD2 = rgb565(mixRgb(customBgRgb, customTextRgb, 17));
+    GRAY = rgb565(mixRgb(customTextRgb, customBgRgb, 30));
+  }
+}
+
+void setDisplayBacklight() {
+  // Der laufende ESP32 wird nicht schlafen gelegt:
+  // WLAN, Messung und MQTT bleiben beim Timeout aktiv.
+  int duty = displayAwake ? (int)displayBrightness * 255 / 100 : 0;
+  analogWrite(TFT_LED, duty);
+}
+
+void maintainDisplayTimeout() {
+  if (!displayAwake || displayTimeoutChoice == 0) return;
+  const unsigned long duration =
+    (unsigned long)DISPLAY_TIMEOUT_MINUTES[displayTimeoutChoice] * 60000UL;
+  if (millis() - lastDisplayInteraction >= duration) {
+    displayAwake = false;
+    setDisplayBacklight();
+  }
+}
+
+void notifyDisplay(const String &message) {
+  if (!displayNotifications) return;
+  displayNotice = message.substring(0, 120);
+  displayNoticeType = N_START; // Universeller alter Hinweis ohne Ereignistyp.
+  displayNoticeUntil = millis() + 5000UL;
+  noticePopupDrawn = false;
+  pageDirty = true;
+}
+
+String timeoutLabel(uint8_t which) {
+  if (which == 0) return "Nie";
+  return String(DISPLAY_TIMEOUT_MINUTES[which]) + " Minuten";
+}
+
+void saveDisplayPrefs() {
+  // Verhindert unlesbare Beschriftungen.
+  if (pendingCustomColors && !readableColors(pendingBgRgb, pendingTextRgb)) {
+    logEvent("Display-Farben: Kontrast zu gering");
+    return;
+  }
+  displayBrightness = pendingBrightness;
+  displayTimeoutChoice = pendingTimeoutChoice;
+  displayDarkMode = pendingDarkMode;
+  displayNotifications = pendingNotifications;
+  customColorsEnabled = pendingCustomColors;
+  customBgRgb = pendingBgRgb & 0xFFFFFFUL;
+  customTextRgb = pendingTextRgb & 0xFFFFFFUL;
+  prefs.putUChar("dBright", displayBrightness);
+  prefs.putUChar("dTime", displayTimeoutChoice);
+  prefs.putBool("dDark", displayDarkMode);
+  prefs.putBool("dNotice", displayNotifications);
+  prefs.putBool("custClr", customColorsEnabled);
+  prefs.putUInt("bgRGB", customBgRgb);
+  prefs.putUInt("txRGB", customTextRgb);
+  applyDisplayTheme();
+  displayAwake = true;
+  lastDisplayInteraction = millis();
+  setDisplayBacklight();
+  logEvent("V1.0.0 Anzeigeeinstellungen gespeichert");
+  currentPage = PAGE_SYSTEM;
+  pageDirty = true;
+}
+
+void openDisplaySettings() {
+  pendingBrightness = displayBrightness;
+  pendingTimeoutChoice = displayTimeoutChoice;
+  pendingDarkMode = displayDarkMode;
+  pendingNotifications = displayNotifications;
+  pendingCustomColors = customColorsEnabled;
+  pendingBgRgb = customBgRgb;
+  pendingTextRgb = customTextRgb;
+  updatePendingColorDefaults();
+  currentPage = PAGE_DISPLAY_SETTINGS;
+  pageDirty = true;
+}
+
+String durationText(uint32_t seconds) {
+  return String(seconds / 3600) + "h " +
+         String((seconds % 3600) / 60) + "m";
+}
+
+// Bambu sendet die Restzeit in Minuten. Einheitlich als h und min anzeigen.
+String bambuRemainingText(int minutes) {
+  if (minutes < 0) return "--";
+  int hours = minutes / 60;
+  int mins = minutes % 60;
+  return String(hours) + " h " + (mins < 10 ? "0" : "") + String(mins) + " min";
+}
+
+String timestamp() {
+  struct tm t;
+
+  if (getLocalTime(&t, 10)) {
+    char buffer[24];
+
+    strftime(
+      buffer,
+      sizeof(buffer),
+      "%d.%m.%Y %H:%M",
+      &t
+    );
+
+    return String(buffer);
+  }
+
+  return "Ohne Datum";
+}
+
+void logEvent(String message) {
+  Serial.println(message);
+
+  logLines[logNext] =
+    timestamp() + " | " + message;
+
+  logNext = (logNext + 1) % MAX_LOGS;
+}
+
+const char* noticeName(NoticeType type) {
+  switch (type) {
+    case N_LOW: return "Filament niedrig";
+    case N_START: return "Druck gestartet";
+    case N_END: return "Druck abgeschlossen";
+    case N_FAILED: return "Druck fehlgeschlagen";
+    case N_MOTION: return "Messstoerung";
+    case N_LOST: return "Verbindung verloren";
+    case N_RESTORED: return "Verbindung hergestellt";
+    case N_PAUSE: return "Druck pausiert";
+    default: return "Meldung";
+  }
+}
+void emitNotice(NoticeType type, const String &message) {
+  logEvent(String("Meldung [") + noticeName(type) + "]: " + message);
+  uint16_t bit = (uint16_t)1U << (uint8_t)type;
+  if (displayNotifications && (noticeDisplayMask & bit)) {
+    displayNotice = message.substring(0, 120);
+    displayNoticeType = type;
+    displayNoticeUntil = millis() + 5000UL;
+    noticePopupDrawn = false;
+    pageDirty = true;
+  }
+  if (noticeWebMask & bit) {
+    for (uint8_t i = min((int)noticeCount, (int)MAX_NOTICES - 1); i > 0; --i)
+      noticeRecords[i] = noticeRecords[i - 1];
+    noticeRecords[0] = {++noticeSequence, type, message, timestamp()};
+    if (noticeCount < MAX_NOTICES) ++noticeCount;
+  }
+}
+void saveV18Settings() {
+  prefs.putUInt("ntDMask", noticeDisplayMask);
+  prefs.putUInt("ntWMask", noticeWebMask);
+  prefs.putFloat("lowGram", lowFilamentThreshold);
+}
+
+
+void redirect(String path) {
+  server.sendHeader("Location", path);
+  server.send(303, "text/plain", "");
+}
+
+bool checkLogin() {
+  if (server.authenticate(WEB_USER, WEB_PASS)) {
+    return true;
+  }
+
+  server.requestAuthentication(
+    BASIC_AUTH,
+    "Filamentwaage V1.0.0",
+    "Bitte Benutzername und Passwort eingeben"
+  );
+
+  return false;
+}
+
+String currentIP() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return WiFi.localIP().toString();
+  }
+
+  return "OFFLINE";
+}
+
+// =====================================================
+// 12. PROFILE LADEN UND SPEICHERN
+// =====================================================
+
+void defaultProfiles() {
+  profileCount = 1;
+  activeProfile = 0;
+
+  profiles[0].name = "Geeetech";
+  profiles[0].material = "PLA";
+  profiles[0].emptyWeight = 170.0f;
+  profiles[0].fullWeight = 1000.0f;
+  profiles[0].rgb = 0x21C5FF;
+  profiles[0].priceKg = 0;
+}
+
+void saveProfiles() {
+  prefs.putUInt("pc", profileCount);
+  prefs.putUInt("pa", activeProfile);
+
+  for (int i = 0; i < MAX_PROFILES; i++) {
+    String key = "p" + String(i);
+
+    if (i >= profileCount) {
+      prefs.remove(key.c_str());
+      continue;
+    }
+
+    JsonDocument doc;
+
+    doc["n"] = profiles[i].name;
+    doc["m"] = profiles[i].material;
+    doc["e"] = profiles[i].emptyWeight;
+    doc["f"] = profiles[i].fullWeight;
+    doc["rgb"] = profiles[i].rgb;
+    doc["price"] = profiles[i].priceKg;
+
+    String json;
+    serializeJson(doc, json);
+
+    prefs.putString(key.c_str(), json);
+  }
+}
+
+void loadProfiles() {
+  profileCount = prefs.getUInt("pc", 0);
+
+  if (profileCount < 1 ||
+      profileCount > MAX_PROFILES) {
+    defaultProfiles();
+    saveProfiles();
+    return;
+  }
+
+  for (int i = 0; i < profileCount; i++) {
+    JsonDocument doc;
+
+    String json = prefs.getString(
+      ("p" + String(i)).c_str(),
+      ""
+    );
+
+    if (deserializeJson(doc, json)) {
+      defaultProfiles();
+      saveProfiles();
+      return;
+    }
+
+    profiles[i].name = doc["n"].as<String>();
+    profiles[i].material = doc["m"].as<String>();
+    profiles[i].emptyWeight = doc["e"] | 170.0f;
+    profiles[i].fullWeight = doc["f"] | 1000.0f;
+    profiles[i].rgb = doc["rgb"] | 0x21C5FF;
+    profiles[i].priceKg = clampFloat(doc["price"] | 0.0f, 0, 1000);
+  }
+
+  activeProfile = constrain(
+    (int)prefs.getUInt("pa", 0),
+    0,
+    profileCount - 1
+  );
+}
+
+void changeProfile(int direction) {
+  activeProfile += direction;
+
+  if (activeProfile < 0) {
+    activeProfile = profileCount - 1;
+  }
+
+  if (activeProfile >= profileCount) {
+    activeProfile = 0;
+  }
+
+  prefs.putUInt("pa", activeProfile);
+  warnedLow = false;
+  if (printActive || printEndPending) hybridMajorDisturbance = true;
+  pageDirty = true;
+}
+
+// =====================================================
+// 13. ARCHIV LADEN UND SPEICHERN
+// =====================================================
+
+void saveHistory() {
+  prefs.putUInt("hc", historyCount);
+
+  for (int i = 0; i < historyCount; i++) {
+    JsonDocument doc;
+
+    doc["d"] = historyItems[i].date;
+    doc["n"] = historyItems[i].name;
+    doc["f"] = historyItems[i].filament;
+    doc["u"] = historyItems[i].used;
+    doc["sw"] = historyItems[i].startWeight;
+    doc["ew"] = historyItems[i].endWeight;
+    doc["t"] = historyItems[i].seconds;
+    doc["cost"] = historyItems[i].cost;
+    doc["ok"] = historyItems[i].confirmed;
+
+    String json;
+    serializeJson(doc, json);
+
+    prefs.putString(
+      ("h" + String(i)).c_str(),
+      json
+    );
+  }
+}
+
+void loadHistory() {
+  historyCount = constrain(
+    (int)prefs.getUInt("hc", 0),
+    0,
+    MAX_HISTORY
+  );
+
+  for (int i = 0; i < historyCount; i++) {
+    JsonDocument doc;
+
+    deserializeJson(
+      doc,
+      prefs.getString(
+        ("h" + String(i)).c_str(),
+        ""
+      )
+    );
+
+    historyItems[i].date = doc["d"].as<String>();
+    historyItems[i].name = doc["n"].as<String>();
+    historyItems[i].filament = doc["f"].as<String>();
+    historyItems[i].used = doc["u"] | 0.0f;
+    historyItems[i].startWeight = doc["sw"] | 0.0f;
+    historyItems[i].endWeight = doc["ew"] | 0.0f;
+    historyItems[i].seconds = doc["t"] | 0UL;
+    historyItems[i].cost = clampFloat(doc["cost"] | 0.0f, 0, 5000);
+    historyItems[i].confirmed = doc["ok"] | false; // V1.7: keine bestaetigte Hybrid-Endmessung
+  }
+}
+
+void archivePrint(
+  String name,
+  float used,
+  float startWeight,
+  float endWeight,
+  uint32_t seconds,
+  float cost,
+  bool confirmed,
+  String filamentLabel
+) {
+  for (
+    int i = min(historyCount, MAX_HISTORY - 1);
+    i > 0;
+    i--
+  ) {
+    historyItems[i] = historyItems[i - 1];
+  }
+
+  historyItems[0].date = timestamp();
+  historyItems[0].name = name;
+
+  historyItems[0].filament = filamentLabel;
+
+  historyItems[0].used = used;
+  historyItems[0].startWeight = startWeight;
+  historyItems[0].endWeight = endWeight;
+  historyItems[0].seconds = seconds;
+  historyItems[0].cost = cost;
+  historyItems[0].confirmed = confirmed;
+
+  historyCount = min(
+    historyCount + 1,
+    MAX_HISTORY
+  );
+
+  saveHistory();
+}
+
+// =====================================================
+// 14. HX711
+// =====================================================
+
+bool readRawAverage(
+  long& value,
+  int count
+) {
+  if (!scale.wait_ready_timeout(1200)) {
+    return false;
+  }
+
+  value = scale.read_average(count);
+  return true;
+}
+
+bool tareScale() {
+  long value;
+
+  if (!readRawAverage(value, 15)) {
+    logEvent("Tara fehlgeschlagen");
+    return false;
+  }
+
+  zeroOffset = value;
+  zeroValid = true;
+
+  prefs.putLong("zero", zeroOffset);
+  prefs.putBool("zeroOK", true);
+
+  filterReady = false;
+  recentCount = 0;
+  recentIndex = 0;
+  stable = false;
+  lastStableAt = 0;
+  if (printActive || printEndPending) {
+    // Eine Tara waehrend eines Drucks invalidiert die Vergleichsgrundlage.
+    printStartStable = false;
+    hybridMajorDisturbance = true;
+    hybridDisturbed = true;
+  }
+
+  pageDirty = true;
+
+  logEvent(
+    "Nullpunkt gespeichert: " +
+    String(zeroOffset)
+  );
+
+  return true;
+}
+
+void initScale() {
+  scale.begin(HX_DT, HX_SCK);
+  scale.set_gain(128);
+
+  zeroValid = prefs.getBool("zeroOK", false);
+
+  if (zeroValid) {
+    zeroOffset = prefs.getLong("zero", 0);
+
+    logEvent(
+      "Nullpunkt geladen: " +
+      String(zeroOffset)
+    );
+  } else {
+    // NEU V1.5:
+    // Keine automatische Tara beim Hochfahren.
+    logEvent(
+      "Nullpunkt fehlt: Bitte Waage leer tarieren"
+    );
+  }
+
+  logEvent("Kalibrierfaktor: -365.0 FIX");
+}
+
+void updateScale() {
+  if (millis() - lastScaleAt < 180) {
+    return;
+  }
+
+  lastScaleAt = millis();
+
+  if (!scale.is_ready()) {
+    if (millis() - lastScaleOK > 2000) {
+      hxReady = false;
+    }
+    return;
+  }
+
+  long value;
+
+  if (!readRawAverage(value, 3)) {
+    return;
+  }
+
+  rawValue = value;
+  hxReady = true;
+  lastScaleOK = millis();
+
+  if (!zeroValid) {
+    return;
+  }
+
+  float grams =
+    ((float)rawValue - zeroOffset) /
+    SCALE_FACTOR;
+
+  if (!filterReady) {
+    filteredWeight = grams;
+    filterReady = true;
+  } else {
+    float difference =
+      fabsf(grams - filteredWeight);
+
+    if (difference > 5500.0f) {
+      if (printActive || printEndPending) {
+        hybridDisturbed = true;
+        hybridMajorDisturbance = true;
+      }
+      return;
+    }
+
+    float alpha =
+      difference > 20.0f ? 0.65f : 0.25f;
+
+    filteredWeight =
+      (1.0f - alpha) * filteredWeight +
+      alpha * grams;
+  }
+
+  weightGrams = filteredWeight;
+
+  if (fabsf(weightGrams) < 0.25f) {
+    weightGrams = 0;
+  }
+
+  recent[recentIndex] = weightGrams;
+  recentIndex = (recentIndex + 1) % 8;
+
+  if (recentCount < 8) {
+    recentCount++;
+  }
+
+  float low = weightGrams;
+  float high = weightGrams;
+
+  for (int i = 0; i < recentCount; i++) {
+    low = min(low, recent[i]);
+    high = max(high, recent[i]);
+  }
+
+  stable =
+    recentCount == 8 &&
+    high - low < 1.5f;
+
+  if (stable) {
+    lastStableWeight = weightGrams;
+    lastStableAt = millis();
+  }
+
+  // Zusaetzlicher Web-Abzug wirkt auf Gesamtgewicht, Rest und Fuellstand.
+  // Der HX711-Messwert bleibt unveraendert fuer die Hybridmessung.
+  recalculateFilamentRemaining();
+
+  if (printActive) {
+    printDuration = (millis() - printStartMillis) / 1000;
+  }
+  updateHybrid(grams, high - low);
+  monitorLowFilament();
+}
+
+// =====================================================
+// 15. DRUCKMESSUNG
+// =====================================================
+
+void startPrint(bool automatic) {
+  if (printActive || printEndPending || !hxReady || !zeroValid) return;
+  printActive = true;
+  printAutomatic = automatic;
+  // Stabiler Messwert nur nutzbar, wenn er wirklich frisch ist.
+  printStartStable = stable && (millis() - lastStableAt < 5000UL);
+  printStartWeight = printStartStable ? lastStableWeight : weightGrams;
+  hybridProvisional = 0;
+  hybridGoodSamples = 0;
+  hybridLastRaw = printStartWeight;
+  hybridDisturbed = !printStartStable;
+  hybridMajorDisturbance = false;
+  printEndedFailed = false;
+  hybridDisturbedUntil = 0;
+  hybridLastValidAt = 0;
+  printUsed = 0;
+  printStartMillis = millis();
+  printDuration = 0;
+  printName = bambuJob.length() ? bambuJob : "Manueller Druck";
+  printFilamentLabel = active().name + " " + active().material;
+  printPriceKg = active().priceKg;
+  warnedLow = false;
+  logEvent("Druck gestartet: " + printName + (printStartStable ? "" : " (Startwert vorlaeufig)"));
+  emitNotice(N_START, "DRUCK GESTARTET");
+  pageDirty = true;
+}
+
+// Benutzer-STOP und Bambu-Ende starten zuerst eine ruhige Endmessung.
+void stopPrint(bool failed = false) {
+  if (!printActive) return;
+  printEndedFailed = failed;
+  printDuration = (millis() - printStartMillis) / 1000;
+  printActive = false;
+  printAutomatic = false;
+  printEndPending = true;
+  printEndRequestedAt = millis();
+  printEndQuietSince = 0;
+  logEvent("Druckende erkannt; warte auf stabile Endmessung");
+  pageDirty = true;
+}
+
+// Geruehrte Spule / Zug: vorlaeufiger Verbrauch wird nicht weiter hochgerechnet.
+void updateHybrid(float rawGrams, float windowSpan) {
+  if (!printActive && !printEndPending) {
+    hybridLastRaw = rawGrams;
+    return;
+  }
+  float rawStep = isfinite(hybridLastRaw) ? fabsf(rawGrams - hybridLastRaw) : 0.0f;
+  bool jump = rawStep > 6.0f;
+  hybridLastRaw = rawGrams;
+  bool motion = jump || windowSpan > 3.5f ||
+                fabsf(rawGrams - weightGrams) > 7.0f;
+  if (motion) {
+    if (rawStep > 25.0f || windowSpan > 25.0f) {
+      // Bei Spulenwechsel / massivem Zug kann die Endmessung nicht bestaetigt werden.
+      hybridMajorDisturbance = true;
+    }
+    if (!hybridDisturbed) emitNotice(N_MOTION, "MESSSTOERUNG ERKANNT");
+    hybridDisturbed = true;
+    hybridDisturbedUntil = millis() + 2500UL;
+    hybridGoodSamples = 0;
+  } else if (hybridDisturbed &&
+             (int32_t)(millis() - hybridDisturbedUntil) >= 0) {
+    // Erst mehrere unauffaellige Messungen erlauben erneut Live-Updates.
+    if (++hybridGoodSamples >= 5) {
+      hybridDisturbed = false;
+      hybridGoodSamples = 0;
+    }
+  }
+  if (!hybridDisturbed && hxReady && zeroValid) {
+    hybridLastValidAt = millis();
+    if (printActive) {
+      float measured = printStartWeight - weightGrams;
+      if (isfinite(measured) && measured >= -5 && measured < 5000.0f) {
+        measured = max(0.0f, measured);
+        hybridProvisional = 0.78f * hybridProvisional + 0.22f * measured;
+        printUsed = hybridProvisional;
+      }
+    }
+  }
+  if (printEndPending) {
+    if (stable && !hybridDisturbed &&
+        (int32_t)(millis() - hybridDisturbedUntil) >= 0) {
+      if (printEndQuietSince == 0) printEndQuietSince = millis();
+    } else {
+      printEndQuietSince = 0;
+    }
+  }
+}
+
+void serviceHybridFinal() {
+  if (!printEndPending) return;
+  const bool timedOut = millis() - printEndRequestedAt > 90000UL;
+  const bool quiet = printEndQuietSince &&
+                     millis() - printEndQuietSince >= 3500UL &&
+                     lastStableAt >= printEndRequestedAt &&
+                     millis() - lastStableAt < 1200UL;
+  if (!quiet && !timedOut) return;
+  float endWeight = quiet ? lastStableWeight : weightGrams;
+  float delta = printStartWeight - endWeight;
+  bool good = quiet && printStartStable && !hybridMajorDisturbance &&
+              hxReady && zeroValid && isfinite(delta) && delta >= -2.0f &&
+              delta <= min(5000.0f, active().fullWeight + 300.0f);
+  float consumed = good ? max(0.0f, delta) : clampFloat(printUsed, 0, 5000);
+  float cost = (printPriceKg > 0) ? consumed * printPriceKg / 1000.0f : 0;
+  printUsed = consumed;
+  lastPrintConfirmed = good;
+  archivePrint(printName, consumed, printStartWeight, endWeight,
+               printDuration, cost, good, printFilamentLabel);
+  printEndPending = false;
+  logEvent(String("Druck archiviert: ") + String(consumed, 1) + " g (" +
+           (good ? "Endmessung bestaetigt" : "vorlaeufig / Messung unsicher") + ")");
+  emitNotice(N_END, String(printEndedFailed ? "DRUCK FEHLER: " :
+                  (good ? "DRUCK FERTIG: " : "DRUCK VORLAEUFIG: ")) +
+            String(consumed, 1) + " g / " + String(cost, 2) + " EUR");
+  pageDirty = true;
+}
+
+void monitorLowFilament() {
+  if (!printActive || !stable || !zeroValid || !hxReady ||
+      lowFilamentThreshold <= 0 || hybridDisturbed) return;
+  if (!warnedLow && restGrams > 1.0f && restGrams <= lowFilamentThreshold) {
+    warnedLow = true;
+    emitNotice(N_LOW, "FILAMENT NIEDRIG: " + String(restGrams, 0) + " g");
+  } else if (warnedLow && restGrams > lowFilamentThreshold + 15.0f) {
+    warnedLow = false;
+  }
+}
+
+String hybridStatusLabel() {
+  if (printEndPending) return "ENDMESSUNG";
+  if (printActive && hybridDisturbed) return "GESTOERT";
+  if (printActive) return printStartStable ? "LIVE VORLAEUFIG" : "START UNGEWISS";
+  return lastPrintConfirmed ? "ENDE BESTAETIGT" : "BEREIT";
+}
+
+String filamentEnough() {
+  if (expectedGrams <= 0) {
+    return "KEINE MENGE EINGETRAGEN";
+  }
+
+  return restGrams >= expectedGrams
+    ? "JA"
+    : "NEIN";
+}
+
+// =====================================================
+// 16. WLAN
+// =====================================================
+
+void connectWiFi() {
+  logEvent("Verbinde mit Heim-WLAN...");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long started = millis();
+
+  while (
+    WiFi.status() != WL_CONNECTED &&
+    millis() - started < 15000
+  ) {
+    delay(250);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiWasConnected = true;
+
+    logEvent(
+      "WLAN verbunden: http://" +
+      WiFi.localIP().toString()
+    );
+
+    configTzTime(
+      "CET-1CEST,M3.5.0,M10.5.0/3",
+      "pool.ntp.org",
+      "time.google.com"
+    );
+  } else {
+    logEvent("WLAN nicht erreichbar");
+  }
+
+  lastWifiAttempt = millis();
+}
+
+void maintainWiFi() {
+  bool connected =
+    WiFi.status() == WL_CONNECTED;
+
+  if (connected) {
+    if (!wifiWasConnected) {
+      logEvent(
+        "WLAN wieder verbunden: " +
+        currentIP()
+      );
+      pageDirty = true;
+    }
+
+    wifiWasConnected = true;
+    return;
+  }
+
+  if (wifiWasConnected) {
+    wifiWasConnected = false;
+    logEvent("WLAN-Verbindung verloren");
+    pageDirty = true;
+  }
+
+  if (millis() - lastWifiAttempt < 20000) {
+    return;
+  }
+
+  lastWifiAttempt = millis();
+
+  WiFi.disconnect(false);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
+// =====================================================
+// 17. BAMBU CLOUD
+// =====================================================
+
+bool bambuConfigured() {
+  return
+    String(BAMBU_SN) != "DEINE_SERIENNUMMER" &&
+    String(BAMBU_TOKEN) != "DEIN_ACCESS_TOKEN" &&
+    String(BAMBU_UID) != "DEINE_UID" &&
+    strlen(BAMBU_SN) > 0 &&
+    strlen(BAMBU_TOKEN) > 0 &&
+    strlen(BAMBU_UID) > 0;
+}
+
+void onBambuMessage(
+  char* topic,
+  byte* payload,
+  unsigned int length
+) {
+  JsonDocument doc;
+
+  if (deserializeJson(doc, payload, length)) {
+    return;
+  }
+
+  JsonVariant p = doc["print"];
+
+  if (p.isNull()) {
+    return;
+  }
+
+  lastBambuMessage = millis();
+  mqttStaleReported = false;
+
+  // Drucktemperaturen / Schichtinformation
+  if (!p["nozzle_temper"].isNull())
+    bambuNozzleTemp = p["nozzle_temper"].as<float>();
+  if (!p["nozzle_target_temper"].isNull())
+    bambuNozzleTarget = p["nozzle_target_temper"].as<float>();
+  if (!p["bed_temper"].isNull())
+    bambuBedTemp = p["bed_temper"].as<float>();
+  if (!p["bed_target_temper"].isNull())
+    bambuBedTarget = p["bed_target_temper"].as<float>();
+  if (!p["layer_num"].isNull())
+    bambuLayer = p["layer_num"].as<int>();
+  if (!p["total_layer_num"].isNull())
+    bambuTotalLayers = p["total_layer_num"].as<int>();
+  if (!p["print_error"].isNull()) {
+    uint32_t nextError = p["print_error"].as<uint32_t>();
+    if (nextError != 0 && nextError != bambuError) {
+      emitNotice(N_FAILED, "DRUCKERFEHLER");
+    }
+    bambuError = nextError;
+  }
+
+  // AMS Lite: Array mit einer Einheit und vier Trays.
+  // Teilmeldungen ohne AMS-Daten ueberschreiben nichts.
+  JsonVariantConst ams = p["ams"];
+  if (!ams.isNull() && ams["ams"].is<JsonArray>()) {
+    JsonArrayConst units = ams["ams"].as<JsonArrayConst>();
+    for (JsonVariantConst unit : units) {
+      int unitId = unit["id"].as<String>().toInt();
+      if (unitId != 0 || !unit["tray"].is<JsonArray>()) continue;
+      for (JsonVariantConst tray : unit["tray"].as<JsonArrayConst>()) {
+        int id = tray["id"].as<String>().toInt();
+        if (id >= 0 && id < 4) takeBambuTray(tray, amsSlots[id]);
+      }
+    }
+  }
+
+  // A1 Mini: externe Spule als vt_tray; vir_slot bei
+  // neueren Meldungen ebenfalls unterstuetzen.
+  JsonVariantConst virtualTrays = p["vir_slot"];
+  if (virtualTrays.is<JsonArray>()) {
+    for (JsonVariantConst slot : virtualTrays.as<JsonArrayConst>()) {
+      int id = slot["id"].as<String>().toInt();
+      if (id == 254 || id == 255) {
+        takeBambuTray(slot, externalSlot);
+        break;
+      }
+    }
+  } else {
+    JsonVariantConst vt = p["vt_tray"];
+    if (!vt.isNull()) takeBambuTray(vt, externalSlot);
+  }
+
+  if (!p["subtask_name"].isNull()) {
+    String name =
+      p["subtask_name"].as<String>();
+
+    if (name.length()) {
+      bambuJob = name;
+    }
+  }
+
+  if (!p["mc_percent"].isNull()) {
+    bambuProgress = constrain(
+      p["mc_percent"].as<int>(),
+      0,
+      100
+    );
+  }
+
+  if (!p["mc_remaining_time"].isNull()) {
+    bambuRemaining =
+      p["mc_remaining_time"].as<int>();
+  }
+
+  if (!p["gcode_state"].isNull()) {
+    String next =
+      p["gcode_state"].as<String>();
+
+    next.toUpperCase();
+
+    String old = bambuState;
+    bambuState = next;
+    if (next != old) {
+      if (next == "FAILED") emitNotice(N_FAILED, "DRUCK FEHLER");
+      else if (next == "PAUSE") emitNotice(N_PAUSE, "DRUCK PAUSIERT");
+    }
+
+    if (
+      bambuStateKnown &&
+      next == "RUNNING" &&
+      old != "RUNNING" &&
+      old != "PAUSE"
+    ) {
+      // Wird ein neuer Druck waehrend einer alten Endmessung gestartet,
+      // die vorige Messung als unsicher abschliessen und nicht verlieren.
+      if (printEndPending) {
+        printEndRequestedAt = millis() - 91000UL;
+        serviceHybridFinal();
+      }
+      startPrint(true);
+    }
+
+    if (next == "FINISH" && old != "FINISH" && !printActive &&
+        !printEndPending && bambuStateKnown) {
+      emitNotice(N_END, "BAMBU DRUCK FERTIG (OHNE WAAGENMESSUNG)");
+    }
+    if (
+      printActive &&
+      printAutomatic &&
+      (
+        next == "FINISH" ||
+        next == "FAILED" ||
+        next == "IDLE"
+      )
+    ) {
+      stopPrint(next == "FAILED");
+    }
+
+    bambuStateKnown = true;
+  }
+}
+
+void connectBambu() {
+  if (!bambuConfigured()) {
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  if (mqtt.connected()) {
+    return;
+  }
+
+  if (millis() - lastMQTTAttempt < 20000) {
+    return;
+  }
+
+  lastMQTTAttempt = millis();
+
+  String mqttUser =
+    "u_" + String(BAMBU_UID);
+
+  String clientID =
+    "FWV18-" +
+    String(
+      (uint32_t)ESP.getEfuseMac(),
+      HEX
+    );
+
+  logEvent("Verbinde Bambu Cloud...");
+
+  bool success = mqtt.connect(
+    clientID.c_str(),
+    mqttUser.c_str(),
+    BAMBU_TOKEN
+  );
+
+  if (success) {
+    String topic =
+      "device/" +
+      String(BAMBU_SN) +
+      "/report";
+
+    mqtt.subscribe(topic.c_str());
+
+    bambuConnected = true;
+    if (bambuLinkWasDown && everBambuConnected) emitNotice(N_RESTORED, "BAMBU WIEDER VERBUNDEN");
+    everBambuConnected = true;
+    bambuLinkWasDown = false;
+    mqttStaleReported = false;
+    bambuStateKnown = false;
+    bambuState = "VERBUNDEN";
+
+    logEvent("Bambu Cloud verbunden");
+  } else {
+    bambuConnected = false;
+    bambuState = "OFFLINE";
+
+    logEvent(
+      "MQTT Fehler: " +
+      String(mqtt.state())
+    );
+  }
+
+  pageDirty = true;
+}
+
+void maintainBambu() {
+  if (!bambuConfigured()) {
+    bambuState = "NICHT EINGERICHTET";
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    if (bambuConnected) {
+      bambuLinkWasDown = true;
+      emitNotice(N_LOST, "WLAN / BAMBU OFFLINE");
+    }
+    bambuConnected = false;
+    bambuState = "OFFLINE";
+    return;
+  }
+
+  if (!mqtt.connected()) {
+    if (bambuConnected) {
+      bambuConnected = false;
+      bambuLinkWasDown = true;
+      emitNotice(N_LOST, "BAMBU VERBINDUNG VERLOREN");
+      bambuState = "OFFLINE";
+      pageDirty = true;
+    }
+
+    connectBambu();
+  } else {
+    mqtt.loop();
+    // MQTT kann online sein, obwohl laengere Zeit keine Druckdaten kommen.
+    // Dies wird nur als "Daten alt" protokolliert, nicht als Netzabbruch.
+    if (lastBambuMessage && millis() - lastBambuMessage > 180000UL && !mqttStaleReported) {
+      mqttStaleReported = true;
+      logEvent("Bambu: seit 180 s keine Druckdaten (MQTT verbunden)");
+    }
+  }
+}
+
+// =====================================================
+// 18. ZEICHENFUNKTIONEN
+// =====================================================
+
+void txt(
+  String s,
+  int x,
+  int y,
+  int size,
+  uint16_t color,
+  uint8_t datum = TL_DATUM
+) {
+  lcd.setTextDatum(datum);
+  lcd.setTextSize(size);
+  lcd.setTextColor(color);
+  lcd.drawString(s, x, y);
+}
+
+void card(
+  int x,
+  int y,
+  int w,
+  int h,
+  uint16_t color = CARD
+) {
+  lcd.fillRoundRect(
+    x, y, w, h, 9, color
+  );
+}
+
+void button(
+  int x,
+  int y,
+  int w,
+  int h,
+  String label,
+  uint16_t color
+) {
+  card(x, y, w, h, color);
+
+  uint16_t buttonInk = (color == BLUE || color == GREEN || color == RED)
+    ? 0xFFFF : WHITE;
+  txt(
+    label,
+    x + w / 2,
+    y + h / 2,
+    1,
+    buttonInk,
+    middle_center
+  );
+}
+
+void bar(
+  int x,
+  int y,
+  int w,
+  int h,
+  float percent,
+  uint16_t color
+) {
+  lcd.fillRoundRect(
+    x, y, w, h, 5, CARD2
+  );
+
+  int filled =
+    (int)(
+      w *
+      clampFloat(percent, 0, 100) /
+      100
+    );
+
+  if (filled > 0) {
+    lcd.fillRoundRect(
+      x, y, filled, h, 5, color
+    );
+  }
+}
+
+void spriteText(
+  String s,
+  int x,
+  int y,
+  int size,
+  uint16_t color,
+  uint8_t datum = TL_DATUM
+) {
+  sprite.setTextDatum(datum);
+  sprite.setTextSize(size);
+  sprite.setTextColor(color);
+  sprite.drawString(s, x, y);
+}
+
+void pushSpriteAt(int x, int y) {
+  if (spriteReady) {
+    sprite.pushSprite(x, y);
+  }
+}
+
+// =====================================================
+// 19. DISPLAY-KOPFZEILE UND NAVIGATION
+// =====================================================
+
+void drawHeader() {
+  lcd.fillRect(
+    0, 0, 480, 42, CARD
+  );
+
+  txt(
+    "FILAMENTWAAGE V1.0.0",
+    12, 11, 2, WHITE
+  );
+
+  txt(
+    WiFi.status() == WL_CONNECTED
+      ? "WLAN OK"
+      : "OFFLINE",
+    467,
+    17,
+    1,
+    WiFi.status() == WL_CONNECTED
+      ? GREEN
+      : YELLOW,
+    TR_DATUM
+  );
+  // Meldungen werden als gut lesbare Popups NACH den Seiteninhalten
+  // gezeichnet; hier nichts mehr in die schmale Kopfzeile schreiben.
+}
+
+void drawFooter() {
+  lcd.fillRect(
+    0, 266, 480, 54, CARD
+  );
+
+  const char* labels[] = {
+    "WAAGE", "PROFILE", "DRUCK", "BAMBU", "SYSTEM"
+  };
+
+  for (int i = 0; i < 5; i++) {
+    int x = 3 + i * 96;
+    card(
+      x, 274, 90, 38,
+      (int)currentPage == i ? BLUE : CARD2
+    );
+    txt(labels[i], x + 45, 293, 1,
+        (int)currentPage == i ? 0xFFFF : WHITE, middle_center);
+  }
+}
+
+// =====================================================
+// V1.8: Farbige Meldungsboxen (5 Sekunden; keine blockierenden delays)
+// =====================================================
+
+uint16_t noticeAccent(NoticeType type) {
+  switch (type) {
+    case N_LOW:      return lcd.color565(255, 194, 67);  // Warnung gelb
+    case N_START:    return lcd.color565(100, 185, 255); // Info blau
+    case N_END:      return lcd.color565(79, 228, 154);  // Erfolg gruen
+    case N_FAILED:   return lcd.color565(255, 99, 112);  // Fehler rot
+    case N_MOTION:   return lcd.color565(255, 174, 77);  // Messstoerung orange
+    case N_LOST:     return lcd.color565(255, 99, 112);  // Offline rot
+    case N_RESTORED: return lcd.color565(79, 228, 154);  // Online gruen
+    case N_PAUSE:    return lcd.color565(255, 174, 77);  // Pause orange
+    default:         return lcd.color565(100, 185, 255);
+  }
+}
+
+uint16_t noticeBackground(NoticeType type) {
+  switch (type) {
+    case N_LOW:      return lcd.color565(65, 48, 23);
+    case N_START:    return lcd.color565(24, 48, 73);
+    case N_END:      return lcd.color565(22, 58, 47);
+    case N_FAILED:   return lcd.color565(76, 30, 38);
+    case N_MOTION:   return lcd.color565(70, 43, 29);
+    case N_LOST:     return lcd.color565(76, 30, 38);
+    case N_RESTORED: return lcd.color565(22, 58, 47);
+    case N_PAUSE:    return lcd.color565(70, 43, 29);
+    default:         return lcd.color565(24, 48, 73);
+  }
+}
+
+bool noticeVisible() {
+  return displayNotifications && displayNoticeUntil != 0 &&
+         (int32_t)(millis() - displayNoticeUntil) < 0;
+}
+
+void drawNoticePopup() {
+  if (!noticeVisible()) return;
+  const int x = NOTICE_BOX_X, y = NOTICE_BOX_Y;
+  const int w = NOTICE_BOX_W, h = NOTICE_BOX_H;
+  const uint16_t accent = noticeAccent(displayNoticeType);
+  const uint16_t panel = noticeBackground(displayNoticeType);
+  const uint16_t whiteInk = lcd.color565(255, 255, 255);
+  const uint16_t softInk = lcd.color565(207, 219, 233);
+
+  // Eigene Kontrastfarben: auch bei frei waehlenbarem V1.7-Theme lesbar.
+  lcd.fillRoundRect(x + 4, y + 5, w, h, 12, lcd.color565(6, 10, 17));
+  lcd.fillRoundRect(x, y, w, h, 12, panel);
+  lcd.drawRoundRect(x, y, w, h, 12, accent);
+  lcd.fillRoundRect(x + 12, y + 13, 7, h - 26, 3, accent);
+  txt(displayNotice.startsWith("TEST:") ? "TESTMELDUNG" : "FILAMENTWAAGE", x + 32, y + 13, 1, softInk);
+  txt(String(noticeName(displayNoticeType)), x + 32, y + 35, 2, accent);
+  lcd.drawFastHLine(x + 32, y + 66, w - 51, accent);
+
+  // Text bis zu zwei Zeilen, nach realer Pixelbreite statt festen Zeichen.
+  String remaining = displayNotice;
+  remaining.replace('\n', ' ');
+  remaining.replace('\r', ' ');
+  remaining.trim();
+  const int textWidth = w - 67;
+  for (uint8_t lineNo = 0; lineNo < 2 && remaining.length(); ++lineNo) {
+    lcd.setTextSize(2);
+    String line = remaining;
+    if (lcd.textWidth(line) > textWidth) {
+      int length = line.length();
+      while (length > 1 && lcd.textWidth(line.substring(0, length)) > textWidth)
+        --length;
+      int split = line.lastIndexOf(' ', length);
+      if (split > 3) length = split;
+      line = remaining.substring(0, length);
+      remaining = remaining.substring(length);
+      remaining.trim();
+      if (lineNo == 1 && remaining.length()) {
+        while (line.length() && lcd.textWidth(line + "...") > textWidth)
+          line.remove(line.length() - 1);
+        line += "...";
+      }
+    } else {
+      remaining = "";
+    }
+    line.trim();
+    txt(line, x + 32, y + 76 + 23 * lineNo, 2, whiteInk);
+  }
+  // Sichtbarer Schliessen-Knopf; die komplette Einblendung kann
+  // ausserdem mit einem einzigen Touch geschlossen werden.
+  lcd.drawRoundRect(x + w - 47, y + 13, 30, 28, 6, accent);
+  txt("X", x + w - 32, y + 27, 2, whiteInk, middle_center);
+  txt("Antippen zum Schliessen", x + 32, y + h - 17, 1, softInk);
+}
+
+// =====================================================
+// 20. STATISCHE WAAGENSEITE
+// =====================================================
+
+
+void drawScaleStatic() {
+  // V1.7: Restfilament und Farbe oben, Gesamtgewicht und Prozent unten.
+  card(10, 51, 460, 113);
+  txt("RESTFILAMENT", 22, 62, 1, GRAY);
+  txt("FILAMENTFARBE", 306, 62, 1, GRAY);
+
+  card(10, 174, 282, 81);
+  card(302, 174, 168, 81);
+  txt("GESAMTGEWICHT", 22, 184, 1, GRAY);
+  txt("FUELLSTAND", 315, 184, 1, GRAY);
+}
+
+
+// =====================================================
+// 21. WEITERE DISPLAYSEITEN
+// =====================================================
+
+void drawProfileStatic() {
+  card(10, 51, 460, 132);
+
+  txt(
+    "FILAMENTPROFIL",
+    22, 63, 1, GRAY
+  );
+
+  // Drei breite Schaltflaechen, ohne den bisherigen SYSTEM-Knopf.
+  button(10, 193, 140, 60, "ZURUECK", CARD2);
+  button(160, 193, 140, 60, "WEITER", BLUE);
+  button(310, 193, 160, 60, "RGB WAEHLEN", CARD2);
+}
+
+void drawPrintStatic() {
+  card(10, 51, 460, 111);
+  card(10, 171, 460, 83);
+
+  button(
+    259, 182, 96, 62,
+    "START", GREEN
+  );
+
+  button(
+    365, 182, 96, 62,
+    "STOP", RED
+  );
+
+  txt(
+    "VERBRAUCH",
+    22, 180, 1, GRAY
+  );
+  // Separates Archiv: Die V1.5-Druckmessung bleibt unveraendert.
+  button(350, 55, 110, 23, "ARCHIV", BLUE);
+}
+
+void drawSystemStatic() {
+  // Hauptmenue mit acht echten Touch-Feldern.
+  const char* tiles[] = {
+    "ANZEIGE", "BAMBU", "FILAMENT", "WLAN",
+    "ZUGANG", "SPEICHER", "INFO", "NEUSTART"
+  };
+  for (int i = 0; i < 8; i++) {
+    int col = i % 4;
+    int row = i / 4;
+    int bx = 10 + col * 116;
+    int by = 60 + row * 95;
+    button(bx, by, 106, 82, tiles[i], i == 0 ? BLUE : CARD2);
+  }
+}
+
+void drawDisplaySettings() {
+  lcd.fillScreen(BG);
+  txt("ANZEIGE-EINSTELLUNGEN", 240, 15, 2, WHITE, TC_DATUM);
+  card(12, 45, 456, 207);
+
+  txt("Display-Helligkeit", 25, 54, 1, WHITE);
+  button(270, 49, 54, 34, "-", CARD2);
+  txt(String(pendingBrightness) + "%", 361, 66, 2, WHITE, middle_center);
+  button(404, 49, 54, 34, "+", CARD2);
+  lcd.fillRoundRect(25, 91, 430, 7, 3, CARD2);
+  int w = 430 * (int)pendingBrightness / 100;
+  if (w > 0) lcd.fillRoundRect(25, 91, w, 7, 3, BLUE);
+
+  txt("Display-Timeout", 25, 111, 1, WHITE);
+  button(270, 102, 54, 36, "<", CARD2);
+  txt(timeoutLabel(pendingTimeoutChoice), 362, 120, 1, WHITE, middle_center);
+  button(404, 102, 54, 36, ">", CARD2);
+
+  txt("Dunkelmodus", 25, 152, 1, WHITE);
+  button(331, 143, 125, 32,
+         pendingDarkMode ? "EIN" : "AUS", pendingDarkMode ? BLUE : CARD2);
+
+  txt("Meldungen", 25, 187, 1, WHITE);
+  button(265, 178, 91, 32,
+         pendingNotifications ? "EIN" : "AUS", pendingNotifications ? BLUE : CARD2);
+  button(365, 178, 91, 32, "DETAILS", BLUE);
+
+  txt("Hintergrund / Schrift", 25, 224, 1, WHITE);
+  lcd.fillRoundRect(167, 217, 24, 24, 4, rgb565(pendingBgRgb));
+  lcd.drawRoundRect(167, 217, 24, 24, 4, GRAY);
+  lcd.fillRoundRect(199, 217, 24, 24, 4, rgb565(pendingTextRgb));
+  lcd.drawRoundRect(199, 217, 24, 24, 4, GRAY);
+  button(268, 214, 188, 34, "FARBEN WAEHLEN", BLUE);
+
+  button(12, 258, 213, 52, "ZURUECK", CARD2);
+  button(244, 258, 224, 52, "SPEICHERN", GREEN);
+}
+
+// Meldungen pro Kanal auf dem XPT2046-Touchdisplay schalten.
+void drawNotificationSettings() {
+  lcd.fillScreen(BG);
+  txt("MELDUNGEN", 240, 16, 2, WHITE, TC_DATUM);
+  card(12, 47, 456, 205);
+  txt("EREIGNIS", 25, 54, 1, GRAY);
+  txt("LCD", 338, 54, 1, GRAY, middle_center);
+  txt("WEB", 422, 54, 1, GRAY, middle_center);
+  for (uint8_t row = 0; row < 4; ++row) {
+    uint8_t i = noticePage * 4 + row;
+    if (i >= N_COUNT) break;
+    int y = 77 + row * 42;
+    txt(String(noticeName((NoticeType)i)), 22, y + 16, 1, WHITE, ML_DATUM);
+    bool d = pendingNoticeDisplayMask & (1U << i);
+    bool w = pendingNoticeWebMask & (1U << i);
+    button(302, y, 72, 33, d ? "EIN" : "AUS", d ? BLUE : CARD2);
+    button(389, y, 72, 33, w ? "EIN" : "AUS", w ? BLUE : CARD2);
+  }
+  button(12, 260, 128, 49, "ZURUECK", CARD2);
+  button(152, 260, 145, 49, noticePage ? "SEITE 2/2" : "SEITE 1/2", BLUE);
+  button(310, 260, 158, 49, "SPEICHERN", GREEN);
+}
+
+void drawStats() {
+  float grams = 0, euros = 0;
+  uint8_t good = 0;
+  for (int i = 0; i < historyCount; i++) {
+    grams += historyItems[i].used;
+    euros += historyItems[i].cost;
+    if (historyItems[i].confirmed) ++good;
+  }
+  lcd.fillScreen(BG);
+  txt("DRUCKSTATISTIK", 240, 16, 2, WHITE, TC_DATUM);
+  card(12, 53, 456, 193);
+  txt("Archivierte Drucke: " + String(historyCount), 24, 76, 2, WHITE);
+  txt("Verbrauch: " + String(grams, 1) + " g", 24, 116, 2, GREEN);
+  txt("Kosten: " + String(euros, 2) + " EUR", 24, 157, 2, WHITE);
+  txt("Bestaetigte Endmessungen: " + String(good), 24, 207, 1, GRAY);
+  txt("Auswertung der letzten 12 gespeicherten Drucke", 240, 250, 1, GRAY, TC_DATUM);
+  button(12, 264, 456, 46, "ZURUECK ZUM ARCHIV", CARD2);
+}
+
+void drawSystemDetails() {
+  lcd.fillScreen(BG);
+  String title = "SYSTEM";
+  if (systemDetailsType == 0) title = "WLAN";
+  if (systemDetailsType == 1) title = "ZUGANG";
+  if (systemDetailsType == 2) title = "SPEICHER";
+  if (systemDetailsType == 3) title = "INFO";
+  txt(title, 240, 18, 2, WHITE, TC_DATUM);
+  card(12, 55, 456, 193);
+
+  if (systemDetailsType == 0) {
+    txt("Verbindung: " + String(WiFi.status()==WL_CONNECTED ? "OK" : "OFFLINE"),
+      24, 76, 2, WHITE);
+    txt("IP: " + currentIP(), 24, 116, 2, WHITE);
+    txt("Web: http://" + currentIP(), 24, 166, 1, GRAY);
+  } else if (systemDetailsType == 1) {
+    txt("Webbenutzer: " + String(WEB_USER), 24, 76, 2, WHITE);
+    txt("Passwort nur im Arduino-Code", 24, 122, 1, GRAY);
+    txt("Keine Zugangsdaten am Display", 24, 158, 1, GRAY);
+  } else if (systemDetailsType == 2) {
+    txt("Filamentprofile: " + String(profileCount), 24, 76, 2, WHITE);
+    txt("Druckarchiv: " + String(historyCount) + " / 12", 24, 122, 2, WHITE);
+    txt("NVS: fw-v13 (V1.5 kompatibel)", 24, 166, 1, GRAY);
+  } else {
+    txt("HX711: " + String(hxReady ? "BEREIT" : "WARTET"), 24, 68, 2, WHITE);
+    txt("Kalibrierfaktor: -365.0 FIX", 24, 108, 1, WHITE);
+    txt("Nullpunkt: " + String(zeroOffset), 24, 141, 1, WHITE);
+    txt("Waage leer: TARA druecken", 24, 178, 1, GRAY);
+    button(314, 198, 140, 39, "TARA", BLUE);
+  }
+
+  button(12, 258, 456, 52, "ZURUECK", CARD2);
+}
+
+void drawRestartConfirm() {
+  lcd.fillScreen(BG);
+  txt("ESP32 NEUSTARTEN?", 240, 45, 2, WHITE, TC_DATUM);
+  txt("Die gespeicherten Daten bleiben erhalten.", 240, 113, 1, GRAY, TC_DATUM);
+  button(18, 212, 211, 67, "ABBRECHEN", CARD2);
+  button(251, 212, 211, 67, "NEUSTART", RED);
+}
+
+// Touch-Archiv: 12 gespeicherte Drucke, vier je Seite.
+// CSV-Export bleibt wie in V1.5 in der Weboberflaeche.
+void drawPrintArchive() {
+  lcd.fillScreen(BG);
+  txt("DRUCKARCHIV", 220, 17, 2, WHITE, TC_DATUM);
+  button(351, 8, 117, 35, "STATISTIK", BLUE);
+  if (historyCount == 0) {
+    card(12, 55, 456, 184);
+    txt("Noch keine abgeschlossenen Drucke", 240, 130, 1, GRAY, TC_DATUM);
+  } else {
+    for (int row = 0; row < 4; row++) {
+      int id = printArchiveOffset + row;
+      if (id >= historyCount) break;
+      int y = 54 + row * 48;
+      card(12, y, 456, 43);
+      String name = historyItems[id].name;
+      if (name.length() > 28) name = name.substring(0, 26) + "..";
+      txt(name, 22, y+6, 1, WHITE);
+      txt(historyItems[id].date, 22, y+23, 1, GRAY);
+      txt(String(historyItems[id].used,1) + " g" +
+          (historyItems[id].confirmed ? "" : " ~"), 456, y+17, 1, GREEN, MR_DATUM);
+    }
+  }
+  txt("CSV-Export: Weboberflaeche /history", 240, 248, 1, GRAY, TC_DATUM);
+  button(12, 262, 128, 49, "ZURUECK", CARD2);
+  button(164, 262, 144, 49, "VORHERIGE", BLUE);
+  button(331, 262, 137, 49, "WEITERE", BLUE);
+}
+
+// =====================================================
+// 22. RGB-FARBAUSWAHL
+// =====================================================
+
+// =====================================================
+// BAMBU-DASHBOARD V1.6
+// =====================================================
+
+void drawBambuDashboardStatic() {
+  card(10, 51, 460, 117);
+  card(10, 176, 460, 79);
+}
+
+void renderBambuDashboard() {
+  if (!spriteReady) return;
+
+  // Oberer Bereich: groesserer Druckstatus sowie ausgeschriebene Temperaturen.
+  // Der vorhandene RGB565-Sprite ist 450 x 52 Pixel gross.
+  sprite.fillSprite(CARD);
+
+  spriteText("BAMBU A1 MINI", 4, 0, 1, GRAY);
+  String stateText = bambuState;
+  if (stateText.length() > 19) stateText = stateText.substring(0, 19);
+  spriteText(stateText, 4, 14, stateText.length() > 14 ? 1 : 2,
+             bambuConnected ? GREEN : YELLOW);
+
+  String job = bambuJob.length() ? bambuJob : "Kein Modell";
+  if (job.length() > 34) job = job.substring(0, 32) + "..";
+  spriteText(job, 4, 40, 1, WHITE);
+
+  // ASCII-Beschriftung vermeidet Probleme mit Umlauten im eingebauten TFT-Font.
+  spriteText("DUESE", 244, 1, 1, GRAY);
+  spriteText("DRUCKBETT", 346, 1, 1, GRAY);
+
+  String nozzleNow = isfinite(bambuNozzleTemp)
+    ? String(bambuNozzleTemp, 0) + " C" : "-- C";
+  String bedNow = isfinite(bambuBedTemp)
+    ? String(bambuBedTemp, 0) + " C" : "-- C";
+  spriteText(nozzleNow, 244, 15, 2, WHITE);
+  spriteText(bedNow, 346, 15, 2, WHITE);
+
+  String nozzleGoal = isfinite(bambuNozzleTarget)
+    ? "Soll " + String(bambuNozzleTarget, 0) + " C" : "Soll --";
+  String bedGoal = isfinite(bambuBedTarget)
+    ? "Soll " + String(bambuBedTarget, 0) + " C" : "Soll --";
+  spriteText(nozzleGoal, 244, 39, 1, GRAY);
+  spriteText(bedGoal, 346, 39, 1, GRAY);
+  pushSpriteAt(15, 60);
+
+  // Zweite Zeile: Fortschritt gut lesbar, Restzeit, Schichten, Fehler.
+  sprite.fillSprite(CARD);
+  spriteText(String(bambuProgress) + "%", 4, 1, 3, WHITE);
+
+  String remainingText = bambuRemainingText(bambuRemaining);
+  spriteText("RESTZEIT", 100, 0, 1, GRAY);
+  // 2 h 05 min ist zweizeilig nicht noetig; bei sehr langen Werten kleinere Schrift.
+  spriteText(remainingText, 100, 15, remainingText.length() <= 13 ? 2 : 1, WHITE);
+
+  spriteText("SCHICHTEN", 273, 0, 1, GRAY);
+  String layerText = (bambuLayer >= 0 ? String(bambuLayer) : "--") +
+    "/" + (bambuTotalLayers >= 0 ? String(bambuTotalLayers) : "--");
+  spriteText(layerText, 273, 15, layerText.length() > 10 ? 1 : 2, WHITE);
+
+  if (bambuError != 0) {
+    spriteText("Fehler " + String(bambuError, HEX), 4, 34, 1, RED);
+  } else {
+    spriteText(bambuConnected ? "LIVE" : "OFFLINE", 4, 34, 1,
+               bambuConnected ? GREEN : YELLOW);
+  }
+
+  sprite.fillRoundRect(4, 45, 440, 5, 2, CARD2);
+  int filled = (int)(440.0f * clampFloat(bambuProgress, 0, 100) / 100.0f);
+  if (filled > 0) sprite.fillRect(4, 45, filled, 5, BLUE);
+  pushSpriteAt(15, 112);
+
+  // Untere Karte mit spezieller GROSSANSICHT fuer die externe Spule.
+  // Die Karte reicht von y=176 bis y=255; der Fussbereich beginnt bei y=266.
+  if (bambuViewMode == 1) {
+    // Volle Kartenbreite nur fuer die externe Spule.
+    // Zunaechst den statischen Bereich oben erneuern.
+    lcd.fillRect(20, 181, 440, 13, CARD);
+    txt("EXTERNE SPULE", 22, 181, 1, GRAY);
+
+    sprite.fillSprite(CARD);
+    // V1.7: ausschliesslich Farbe vom Bambu-Drucker (vt_tray/vir_slot).
+    // Niemals mehr als Ersatz die Profilfarbe der Waage verwenden.
+    uint16_t shownColor = externalSlot.colorKnown
+      ? rgb565(externalSlot.color) : CARD2;
+    sprite.fillRoundRect(7, 7, 37, 37, 5, shownColor);
+    sprite.drawRoundRect(7, 7, 37, 37, 5, WHITE);
+    if (!externalSlot.colorKnown)
+      spriteText("?", 19, 14, 2, WHITE);
+
+    String mat = slotMaterial(externalSlot);
+    bool isProfileFallback = mat == "--";
+    if (isProfileFallback) mat = active().material;
+    if (mat.length() > 16) mat = mat.substring(0, 16);
+    spriteText(mat, 55, 0, mat.length() > 13 ? 1 : 2, WHITE);
+    if (isProfileFallback) spriteText("(Profil)", 235, 5, 1, GRAY);
+
+    String remaining = (zeroValid && hxReady)
+      ? String(restGrams, 0) + " g" : "-- g";
+    spriteText(remaining, 55, 29, 2, WHITE);
+    spriteText("WAAGE", 225, 38, 1, GRAY);
+
+    spriteText("FUELLSTAND", 331, 0, 1, GRAY);
+    spriteText(zeroValid && hxReady ? String(fillPercent, 0) + "%" : "--%",
+               331, 15, 3, WHITE);
+    sprite.fillRoundRect(328, 45, 114, 6, 3, CARD2);
+    int extFilled = (int)(114.0f * clampFloat(fillPercent, 0, 100) / 100.0f);
+    if (zeroValid && hxReady && extFilled > 0) {
+      sprite.fillRect(328, 45, extFilled, 6, BLUE);
+    }
+    pushSpriteAt(15, 197);
+    return;
+  }
+
+  // Bisherige AMS-Lite- und Kombinationsansichten bleiben erhalten.
+  sprite.fillSprite(CARD);
+  spriteText("FILAMENT: " + bambuViewName(bambuViewMode), 4, 0, 1, GRAY);
+
+  if (bambuViewMode == 0 || bambuViewMode == 2) {
+    int width = bambuViewMode == 2 ? 57 : 110;
+    for (int i = 0; i < 4; i++) {
+      int x = 4 + i * width;
+      spriteText("A" + String(i + 1), x, 21, 1, GRAY);
+      sprite.fillRoundRect(x + 16, 21, 12, 12, 2,
+        amsSlots[i].colorKnown ? rgb565(amsSlots[i].color) : CARD2);
+      String mat = slotMaterial(amsSlots[i]);
+      int maxLen = bambuViewMode == 2 ? 7 : 12;
+      if (mat.length() > maxLen) mat = mat.substring(0, maxLen);
+      spriteText(mat, x, 36, 1, WHITE);
+    }
+  }
+
+  if (bambuViewMode == 2) {
+    int x = 245;
+    spriteText("EXTERN", x, 21, 1, GRAY);
+    sprite.fillRoundRect(x + 64, 21, 13, 12, 2,
+      externalSlot.colorKnown ? rgb565(externalSlot.color) : CARD2);
+    String mat = slotMaterial(externalSlot);
+    if (mat.length() > 15) mat = mat.substring(0, 15);
+    spriteText(mat, x + 85, 21, 1, WHITE);
+    spriteText("Waage: " +
+      (zeroValid && hxReady ? String(restGrams, 0) + " g" : "--"),
+      x, 36, 1, WHITE);
+  }
+  pushSpriteAt(15, 186);
+}
+
+// Ein eigenes Untermenue im SYSTEM-Bereich.
+void drawBambuOptions() {
+  lcd.fillScreen(BG);
+  txt("BAMBU - ANZEIGE WAEHLEN", 240, 15, 2, WHITE, TC_DATUM);
+  txt("Welche Filamentquellen anzeigen?", 240, 48, 1, GRAY, TC_DATUM);
+
+  button(18, 76, 444, 42,
+    pendingBambuViewMode == 0 ? "[X] AMS LITE (4 PLAETZE)" : "[ ] AMS LITE (4 PLAETZE)",
+    pendingBambuViewMode == 0 ? BLUE : CARD2);
+  button(18, 128, 444, 42,
+    pendingBambuViewMode == 1 ? "[X] EXTERNE SPULE" : "[ ] EXTERNE SPULE",
+    pendingBambuViewMode == 1 ? BLUE : CARD2);
+  button(18, 180, 444, 42,
+    pendingBambuViewMode == 2 ? "[X] BEIDES ANZEIGEN" : "[ ] BEIDES ANZEIGEN",
+    pendingBambuViewMode == 2 ? BLUE : CARD2);
+
+  button(18, 251, 211, 52, "ABBRECHEN", CARD2);
+  button(251, 251, 211, 52, "SPEICHERN", GREEN);
+}
+
+void openBambuOptions() {
+  pendingBambuViewMode = bambuViewMode;
+  currentPage = PAGE_BAMBU_OPTIONS;
+  pageDirty = true;
+}
+
+void saveBambuOptions() {
+  bambuViewMode = pendingBambuViewMode;
+  prefs.putUChar("bview", bambuViewMode);
+  logEvent("Bambu-Ansicht: " + bambuViewName(bambuViewMode));
+  currentPage = PAGE_SYSTEM;
+  pageDirty = true;
+}
+
+// -----------------------------------------------------
+// V1.7: freier RGB-Farbeditor per Touch, auch ohne Browser.
+// Die Aenderungen werden erst unter ANZEIGE > SPEICHERN persistent.
+// -----------------------------------------------------
+void openThemeColors() {
+  updatePendingColorDefaults();
+  editBgRgb = pendingBgRgb;
+  editTextRgb = pendingTextRgb;
+  themeEditTarget = 0;
+  themeColorInputMode = 0;
+  themeHexDigits = "";
+  colorContrastWarning = false;
+  currentPage = PAGE_THEME_COLORS;
+  pageDirty = true;
+}
+
+void drawThemeColors() {
+  lcd.fillScreen(BG);
+  txt("DISPLAY-FARBEN", 240, 12, 2, WHITE, TC_DATUM);
+
+  button(12, 38, 220, 37, "HINTERGRUND", themeEditTarget == 0 ? BLUE : CARD2);
+  button(248, 38, 220, 37, "SCHRIFTFARBE", themeEditTarget == 1 ? BLUE : CARD2);
+
+  // Vorschau und aktueller HEX-Wert des gewaelten Bereichs.
+  uint32_t selected = themeEditTarget == 0 ? editBgRgb : editTextRgb;
+  lcd.fillRoundRect(12, 81, 456, 42, 6, rgb565(editBgRgb));
+  lcd.drawRoundRect(12, 81, 456, 42, 6, GRAY);
+  txt("Aa 123", 23, 93, 2, rgb565(editTextRgb));
+  txt(colorHex(selected), 450, 96, 2, rgb565(editTextRgb), MR_DATUM);
+
+  button(12, 130, 220, 29, "12 FARBEN", themeColorInputMode == 0 ? BLUE : CARD2);
+  button(248, 130, 220, 29, "HEX #RRGGBB", themeColorInputMode == 1 ? BLUE : CARD2);
+
+  if (themeColorInputMode == 0) {
+    // Die gleichen 12 Grundfarben wie bei den Filamentprofilen.
+    for (int i = 0; i < PALETTE_COUNT; i++) {
+      int col = i % 6;
+      int row = i / 6;
+      int px = 17 + col * 77;
+      int py = 165 + row * 40;
+      lcd.fillRoundRect(px, py, 61, 33, 5, rgb565(PALETTE[i]));
+      if (selected == PALETTE[i]) {
+        lcd.drawRoundRect(px - 2, py - 2, 65, 37, 6, WHITE);
+      }
+    }
+    txt("Farbe antippen oder HEX-Code eingeben", 240, 251, 1, GRAY, TC_DATUM);
+  } else {
+    // HEX-Eingabe direkt am Touchdisplay, kein Browser noetig.
+    const char* hexKeys = "0123456789ABCDEF";
+    for (int i = 0; i < 16; i++) {
+      int col = i % 8;
+      int row = i / 8;
+      int kx = 17 + col * 57;
+      int ky = 165 + row * 40;
+      button(kx, ky, 51, 34, String(hexKeys[i]), CARD2);
+    }
+    String entered = "HEX: #" + themeHexDigits;
+    for (int i = themeHexDigits.length(); i < 6; i++) entered += "_";
+    txt(entered, 18, 250, 1, WHITE);
+    button(346, 239, 118, 24, "LOESCHEN", CARD2);
+  }
+
+  bool readable = readableColors(editBgRgb, editTextRgb);
+  txt(readable ? "Kontrast OK" : "Kontrast zu gering!", 240, 273, 1,
+      readable ? GREEN : RED, TC_DATUM);
+  button(12, 281, 140, 32, "ZURUECK", CARD2);
+  button(161, 281, 140, 32, "STANDARD", BLUE);
+  button(310, 281, 158, 32, "UEBERNEHMEN", GREEN);
+}
+
+void drawColorMenu() {
+  lcd.fillScreen(BG);
+
+  txt(
+    "FILAMENTFARBE AUSWAEHLEN",
+    240, 14, 2, WHITE, TC_DATUM
+  );
+
+  txt(
+    active().name + " " + active().material,
+    240, 43, 1, GRAY, TC_DATUM
+  );
+
+  for (int i = 0; i < PALETTE_COUNT; i++) {
+    int col = i % 6;
+    int row = i / 6;
+
+    int x = 17 + col * 77;
+    int y = 76 + row * 66;
+
+    uint16_t color = rgb565(PALETTE[i]);
+
+    lcd.fillRoundRect(
+      x, y, 61, 48, 8, color
+    );
+
+    if (temporaryColor == PALETTE[i]) {
+      lcd.drawRoundRect(
+        x - 3, y - 3,
+        67, 54, 10, WHITE
+      );
+
+      lcd.drawRoundRect(
+        x - 4, y - 4,
+        69, 56, 10, WHITE
+      );
+    }
+  }
+
+  card(16, 211, 448, 39);
+
+  lcd.fillRoundRect(
+    26, 220, 32, 20, 4,
+    rgb565(temporaryColor)
+  );
+
+  txt(
+    colorHex(temporaryColor),
+    70, 229, 2, WHITE, ML_DATUM
+  );
+
+  button(
+    16, 260, 215, 49,
+    "ABBRECHEN", CARD2
+  );
+
+  button(
+    249, 260, 215, 49,
+    "SPEICHERN", GREEN
+  );
+}
+
+void openColorMenu() {
+  temporaryColor = active().rgb;
+  currentPage = PAGE_COLOR;
+  pageDirty = true;
+}
+
+void saveSelectedColor() {
+  active().rgb = temporaryColor;
+
+  saveProfiles();
+
+  logEvent(
+    "RGB gespeichert: " +
+    colorHex(active().rgb)
+  );
+
+  currentPage = PAGE_PROFILE;
+  pageDirty = true;
+}
+
+void cancelColorMenu() {
+  currentPage = PAGE_PROFILE;
+  pageDirty = true;
+}
+
+// =====================================================
+// 23. DYNAMISCHE WAAGENANZEIGE
+// =====================================================
+
+
+void renderScaleDynamic() {
+  if (!spriteReady) return;
+
+  // Die grossen Restgramm und der Farbwert liegen in der oberen Karte.
+  sprite.fillSprite(CARD);
+  String restText = zeroValid && hxReady
+    ? String(restGrams, 1) + " g" : "-- g";
+  spriteText(restText, 12, 4, restText.length() > 10 ? 2 : 3, WHITE);
+  spriteText(stable ? "STABIL" : "MESSUNG LAEUFT", 14, 38, 1,
+             stable ? GREEN : YELLOW);
+
+  uint16_t spoolColor = rgb565(active().rgb);
+  sprite.fillRoundRect(290, 3, 37, 37, 5, spoolColor);
+  sprite.drawRoundRect(290, 3, 37, 37, 5, WHITE);
+  String name = colorName(active().rgb);
+  if (name.length() > 14) name = name.substring(0, 14);
+  spriteText(name, 336, 4, name.length() > 8 ? 1 : 2, WHITE);
+  spriteText(colorHex(active().rgb), 336, 32, 1, GRAY);
+  pushSpriteAt(10, 99);
+
+  // Unten links Gesamtgewicht, rechts Prozente mit schmaler Leiste.
+  sprite.fillSprite(BG);
+  sprite.fillRect(0, 0, 282, 52, CARD);
+  sprite.fillRect(292, 0, 158, 52, CARD);
+  String weightText = zeroValid && hxReady
+    ? String(displayedWeightGrams(), 1) + " g" : "TARA FEHLT";
+  spriteText(weightText, 141, 23, weightText.length() > 10 ? 2 : 3,
+             WHITE, middle_center);
+  String percentText = zeroValid && hxReady
+    ? String(fillPercent, 0) + "%" : "--%";
+  spriteText(percentText, 371, 21, 3, WHITE, middle_center);
+  sprite.fillRoundRect(304, 44, 137, 7, 3, CARD2);
+  int barWidth = (int)(137.0f * clampFloat(fillPercent, 0, 100) / 100.0f);
+  if (zeroValid && hxReady && barWidth > 0)
+    sprite.fillRect(304, 44, barWidth, 7, BLUE);
+  pushSpriteAt(10, 199);
+}
+
+
+// =====================================================
+// 24. DYNAMISCHE PROFILANZEIGE
+// =====================================================
+
+void renderProfileDynamic() {
+  if (!spriteReady) {
+    return;
+  }
+
+  sprite.fillSprite(CARD);
+
+  String name = active().name;
+
+  if (name.length() > 21) {
+    name = name.substring(0, 21);
+  }
+
+  spriteText(
+    name,
+    12, 5, 2, WHITE
+  );
+
+  spriteText(
+    active().material,
+    12, 35, 2,
+    rgb565(active().rgb)
+  );
+
+  spriteText(
+    "Leer: " +
+    String(active().emptyWeight, 0) + " g",
+    250, 9, 1, WHITE
+  );
+
+  spriteText(
+    "Voll: " +
+    String(active().fullWeight, 0) + " g",
+    250, 34, 1, WHITE
+  );
+
+  sprite.fillRoundRect(
+    411, 2, 28, 22, 4,
+    rgb565(active().rgb)
+  );
+
+  pushSpriteAt(10, 98);
+}
+
+// =====================================================
+// 25. DYNAMISCHE DRUCKANZEIGE
+// =====================================================
+
+void renderPrintDynamic() {
+  if (!spriteReady) {
+    return;
+  }
+
+  sprite.fillSprite(CARD);
+
+  spriteText(
+    "BAMBU: " + bambuState,
+    12, 2, 1,
+    bambuConnected ? GREEN : YELLOW
+  );
+
+  String job = bambuJob;
+
+  if (job.length() > 34) {
+    job = job.substring(0, 31) + "...";
+  }
+
+  spriteText(
+    job.length()
+      ? job
+      : "Kein aktives Modell",
+    12, 18, 1, WHITE
+  );
+
+  spriteText(
+    "Fortschritt: " +
+    String(bambuProgress) + "%",
+    12, 33, 2, WHITE
+  );
+
+  pushSpriteAt(10, 80);
+
+  // Druckfortschrittsbalken bleibt blau.
+  bar(
+    22, 143, 428, 9,
+    bambuProgress, BLUE
+  );
+
+  sprite.fillSprite(CARD);
+
+  spriteText(
+    String(printUsed, 1) + " g",
+    12, 7, 2, WHITE
+  );
+
+  spriteText(
+    printEndPending ? "ENDMESSUNG LAEUFT" :
+    (printActive ? (hybridDisturbed ? "MESSUNG GESTOERT" : "LIVE VORLAEUFIG") :
+     (lastPrintConfirmed ? "ENDE BESTAETIGT" : "KEINE MESSUNG")),
+    12,
+    35,
+    1,
+    hybridDisturbed ? YELLOW : (printActive ? GREEN : GRAY)
+  );
+  spriteText(String(printUsed * printPriceKg / 1000.0f, 2) + " EUR",
+             184, 35, 1, WHITE, MR_DATUM);
+
+  sprite.fillRoundRect(
+    249, 0, 96, 62, 9, GREEN
+  );
+
+  sprite.fillRoundRect(
+    355, 0, 95, 62, 9, RED
+  );
+
+  spriteText(
+    "START",
+    297, 31, 1,
+    WHITE, middle_center
+  );
+
+  spriteText(
+    "STOP",
+    402, 31, 1,
+    WHITE, middle_center
+  );
+
+  pushSpriteAt(10, 182);
+}
+
+// =====================================================
+// 26. DYNAMISCHE SYSTEMANZEIGE
+// =====================================================
+
+void renderSystemDynamic() {
+  if (!spriteReady) {
+    return;
+  }
+
+  sprite.fillSprite(CARD);
+
+  spriteText(
+    "HX711: " +
+    String(hxReady ? "BEREIT" : "WARTET"),
+    12, 2, 1,
+    hxReady ? GREEN : YELLOW
+  );
+
+  spriteText(
+    "Kalibrierung: -365.0 FIX",
+    12, 21, 1, WHITE
+  );
+
+  spriteText(
+    "Nullpunkt: " +
+    String(zeroOffset),
+    12, 40, 1, WHITE
+  );
+
+  pushSpriteAt(10, 92);
+
+  sprite.fillSprite(CARD);
+
+  spriteText(
+    "IP: " + currentIP(),
+    12, 12, 1, WHITE
+  );
+
+  pushSpriteAt(10, 148);
+}
+
+// =====================================================
+// 27. DISPLAY AKTUALISIEREN
+// =====================================================
+
+void drawStaticPage() {
+  if (currentPage == PAGE_COLOR || currentPage == PAGE_BAMBU_OPTIONS ||
+      currentPage == PAGE_DISPLAY_SETTINGS || currentPage == PAGE_SYSTEM_DETAILS ||
+      currentPage == PAGE_RESTART_CONFIRM || currentPage == PAGE_PRINT_ARCHIVE ||
+      currentPage == PAGE_THEME_COLORS || currentPage == PAGE_NOTIFICATIONS ||
+      currentPage == PAGE_STATS) {
+    if (currentPage == PAGE_COLOR) drawColorMenu();
+    else if (currentPage == PAGE_BAMBU_OPTIONS) drawBambuOptions();
+    else if (currentPage == PAGE_DISPLAY_SETTINGS) drawDisplaySettings();
+    else if (currentPage == PAGE_SYSTEM_DETAILS) drawSystemDetails();
+    else if (currentPage == PAGE_PRINT_ARCHIVE) drawPrintArchive();
+    else if (currentPage == PAGE_THEME_COLORS) drawThemeColors();
+    else if (currentPage == PAGE_NOTIFICATIONS) drawNotificationSettings();
+    else if (currentPage == PAGE_STATS) drawStats();
+    else drawRestartConfirm();
+    pageDirty = false;
+    return;
+  }
+
+  lcd.fillScreen(BG);
+
+  drawHeader();
+  drawFooter();
+
+  switch (currentPage) {
+    case PAGE_SCALE:
+      drawScaleStatic();
+      break;
+
+    case PAGE_PROFILE:
+      drawProfileStatic();
+      break;
+
+    case PAGE_PRINT:
+      drawPrintStatic();
+      break;
+
+    case PAGE_BAMBU:
+      drawBambuDashboardStatic();
+      break;
+
+    case PAGE_SYSTEM:
+      drawSystemStatic();
+      break;
+
+    default:
+      break;
+  }
+
+  previousSignature = "";
+  pageDirty = false;
+}
+
+String dynamicSignature() {
+  String s =
+    String((int)currentPage) + "|";
+
+  switch (currentPage) {
+    case PAGE_SCALE:
+      s +=
+        String(weightGrams, 1) + "|" +
+        String(restGrams, 1) + "|" +
+        String(fillPercent, 0) + "|" +
+        String(stable) + "|" +
+        String(activeProfile) + "|" +
+        String(hxReady) + "|" + String(zeroValid);
+      break;
+
+    case PAGE_PROFILE:
+      s +=
+        String(activeProfile) + "|" +
+        colorHex(active().rgb);
+      break;
+
+    case PAGE_PRINT:
+      s +=
+        bambuState + "|" +
+        bambuJob + "|" +
+        String(bambuProgress) + "|" +
+        String(printUsed, 1) + "|" +
+        String(printActive) + "|" + String(printEndPending) + "|" +
+        String(hybridDisturbed) + "|" + String(lastPrintConfirmed);
+      break;
+
+    case PAGE_BAMBU:
+      s += bambuState + "|" + bambuJob + "|" +
+        String(bambuProgress) + "|" + String(bambuRemaining) + "|" +
+        String(bambuNozzleTemp, 0) + "|" + String(bambuNozzleTarget, 0) + "|" +
+        String(bambuBedTemp, 0) + "|" + String(bambuBedTarget, 0) + "|" +
+        String(bambuLayer) + "|" + String(bambuTotalLayers) + "|" +
+        String(bambuError) + "|" + String(bambuViewMode) + "|" +
+        String(restGrams, 0);
+      for (int i = 0; i < 4; i++) {
+        s += "|" + amsSlots[i].material + ":" + colorHex(amsSlots[i].color);
+      }
+      s += "|" + externalSlot.material + ":" + colorHex(externalSlot.color) +
+           ":" + String(externalSlot.colorKnown);
+      break;
+
+    case PAGE_SYSTEM:
+      s +=
+        String(hxReady) + "|" +
+        String(zeroOffset) + "|" +
+        currentIP();
+      break;
+
+    case PAGE_COLOR:
+      s += colorHex(temporaryColor);
+      break;
+
+    case PAGE_BAMBU_OPTIONS:
+      s += String(pendingBambuViewMode);
+      break;
+    case PAGE_DISPLAY_SETTINGS:
+    case PAGE_SYSTEM_DETAILS:
+    case PAGE_RESTART_CONFIRM:
+    case PAGE_PRINT_ARCHIVE:
+    case PAGE_THEME_COLORS:
+    case PAGE_NOTIFICATIONS:
+    case PAGE_STATS:
+      break;
+  }
+
+  return s;
+}
+
+void updateDisplay() {
+  // Meldung zeitlich abgelaufen oder durch Einstellungen deaktiviert:
+  // genau einmal die darunterliegende Seite vollstaendig wiederherstellen.
+  if (displayNoticeUntil && !noticeVisible()) {
+    displayNoticeUntil = 0;
+    displayNotice = "";
+    noticePopupDrawn = false;
+    pageDirty = true;
+    // Nach dem Loeschen in derselben LCD-Runde dynamische Werte erneuern.
+    lastDraw = millis() - 300UL;
+  }
+
+  // Eine sichtbare Meldung hat Vorrang vor allen Hintergrund-Updates.
+  // Zeichnen exakt einmal pro Meldung. HX711, WLAN, MQTT und Webserver
+  // laufen weiter, lediglich das LCD-Rendering der Hauptseite pausiert.
+  // Anstehende pageDirty-Updates werden nach Ablauf/Touch nachgeholt.
+  if (noticeVisible()) {
+    if (!noticePopupDrawn) {
+      drawNoticePopup();
+      noticePopupDrawn = true;
+    }
+    return;
+  }
+
+  bool repainted = false;
+  if (pageDirty) {
+    drawStaticPage();
+    repainted = true;
+  }
+
+  const bool submenu =
+      currentPage == PAGE_COLOR || currentPage == PAGE_BAMBU_OPTIONS ||
+      currentPage == PAGE_DISPLAY_SETTINGS || currentPage == PAGE_SYSTEM_DETAILS ||
+      currentPage == PAGE_RESTART_CONFIRM || currentPage == PAGE_PRINT_ARCHIVE ||
+      currentPage == PAGE_THEME_COLORS || currentPage == PAGE_NOTIFICATIONS ||
+      currentPage == PAGE_STATS;
+
+  // Die Sonderseiten bleiben wie in V1.7 statisch. Auf Hauptseiten
+  // wird weiterhin nur bei veraenderter Signatur dynamisch gerendert.
+  if (!submenu && millis() - lastDraw >= 300) {
+    lastDraw = millis();
+    String signature = dynamicSignature();
+    if (signature != previousSignature) {
+      previousSignature = signature;
+      switch (currentPage) {
+        case PAGE_SCALE:   renderScaleDynamic(); break;
+        case PAGE_PROFILE: renderProfileDynamic(); break;
+        case PAGE_PRINT:   renderPrintDynamic(); break;
+        case PAGE_BAMBU:   renderBambuDashboard(); break;
+        case PAGE_SYSTEM:  break;
+        default: break;
+      }
+      repainted = true;
+    }
+  }
+
+  // Kein Popup-Overdraw im normalen 300-ms-Renderzyklus.
+}
+
+// Popup durch Touch schliessen: Seiteninhalt wird im naechsten
+// updateDisplay() genau einmal wiederhergestellt.
+void closeNoticePopup() {
+  displayNoticeUntil = 0;
+  displayNotice = "";
+  noticePopupDrawn = false;
+  pageDirty = true;
+  lastDraw = millis() - 300UL;
+  Serial.println(F("[MELDUNG] Per Touch geschlossen"));
+}
+
+// =====================================================
+// 28. TOUCH-BEDIENUNG
+// =====================================================
+
+bool hit(
+  int x,
+  int y,
+  int bx,
+  int by,
+  int w,
+  int h
+) {
+  return
+    x >= bx &&
+    x < bx + w &&
+    y >= by &&
+    y < by + h;
+}
+
+void updateTouch() {
+  uint16_t x, y;
+
+  bool pressed =
+    lcd.getTouch(&x, &y);
+
+  if (!pressed) {
+    touchDown = false;
+    return;
+  }
+
+  if (touchDown) {
+    return;
+  }
+
+  touchDown = true;
+  lastDisplayInteraction = millis();
+  if (!displayAwake) {
+    displayAwake = true;
+    setDisplayBacklight();
+    pageDirty = true;
+    // Falls eine Meldung sichtbar sein sollte, schliesst der erste
+    // Touch sie gleichzeitig. Sonst weckt er nur das Display.
+    if (noticeVisible()) closeNoticePopup();
+    return;
+  }
+
+  // Popup-Touch VOR dem normalen 180-ms-Debounce pruefen: selbst sehr
+  // schnelle Tippbewegungen schliessen die Einblendung sicher.
+  // Jeder Touchpunkt gilt als Schliessen, auch das X oben rechts.
+  // Wichtig: nicht zur normalen Menue-Touchlogik durchfallen lassen.
+  if (noticeVisible()) {
+    closeNoticePopup();
+    return;
+  }
+
+  if (millis() - lastTouch < 180) {
+    return;
+  }
+
+  lastTouch = millis();
+
+  Serial.printf(
+    "Touch X:%u Y:%u\n",
+    x, y
+  );
+
+  // RGB-UNTERMENUE
+  if (currentPage == PAGE_COLOR) {
+    for (int i = 0; i < PALETTE_COUNT; i++) {
+      int col = i % 6;
+      int row = i / 6;
+
+      int bx = 17 + col * 77;
+      int by = 76 + row * 66;
+
+      if (hit(x, y, bx, by, 61, 48)) {
+        temporaryColor = PALETTE[i];
+        pageDirty = true;
+        return;
+      }
+    }
+
+    if (hit(x, y, 16, 260, 215, 49)) {
+      cancelColorMenu();
+      return;
+    }
+
+    if (hit(x, y, 249, 260, 215, 49)) {
+      saveSelectedColor();
+      return;
+    }
+
+    return;
+  }
+
+  // BAMBU-ANSICHT: Auswahl wird erst nach SPEICHERN aktiv.
+  if (currentPage == PAGE_BAMBU_OPTIONS) {
+    if (hit(x, y, 18, 76, 444, 42)) pendingBambuViewMode = 0;
+    else if (hit(x, y, 18, 128, 444, 42)) pendingBambuViewMode = 1;
+    else if (hit(x, y, 18, 180, 444, 42)) pendingBambuViewMode = 2;
+    else if (hit(x, y, 18, 251, 211, 52)) {
+      currentPage = PAGE_SYSTEM;
+      pageDirty = true;
+      return;
+    } else if (hit(x, y, 251, 251, 211, 52)) {
+      saveBambuOptions();
+      return;
+    }
+    pageDirty = true;
+    return;
+  }
+
+  // DISPLAY-FARBEN: 12 Vorlagen oder sechsstellige HEX-Touch-Tastatur.
+  if (currentPage == PAGE_THEME_COLORS) {
+    if (hit(x, y, 12, 38, 220, 37)) {
+      themeEditTarget = 0;
+      themeHexDigits = "";
+    } else if (hit(x, y, 248, 38, 220, 37)) {
+      themeEditTarget = 1;
+      themeHexDigits = "";
+    } else if (hit(x, y, 12, 130, 220, 29)) {
+      themeColorInputMode = 0;
+      themeHexDigits = "";
+    } else if (hit(x, y, 248, 130, 220, 29)) {
+      themeColorInputMode = 1;
+      themeHexDigits = "";
+    } else if (hit(x, y, 12, 281, 140, 32)) {
+      currentPage = PAGE_DISPLAY_SETTINGS;
+      pageDirty = true;
+      return;
+    } else if (hit(x, y, 161, 281, 140, 32)) {
+      pendingCustomColors = false;
+      updatePendingColorDefaults();
+      currentPage = PAGE_DISPLAY_SETTINGS;
+      pageDirty = true;
+      return;
+    } else if (hit(x, y, 310, 281, 158, 32)) {
+      if (readableColors(editBgRgb, editTextRgb)) {
+        pendingBgRgb = editBgRgb;
+        pendingTextRgb = editTextRgb;
+        pendingCustomColors = true;
+        currentPage = PAGE_DISPLAY_SETTINGS;
+      } else {
+        colorContrastWarning = true;
+      }
+      pageDirty = true;
+      return;
+    } else if (themeColorInputMode == 0) {
+      for (int i = 0; i < PALETTE_COUNT; i++) {
+        int px = 17 + (i % 6) * 77;
+        int py = 165 + (i / 6) * 40;
+        if (hit(x, y, px, py, 61, 33)) {
+          if (themeEditTarget == 0) editBgRgb = PALETTE[i];
+          else editTextRgb = PALETTE[i];
+          themeHexDigits = "";
+          break;
+        }
+      }
+    } else {
+      if (hit(x, y, 346, 239, 118, 24)) {
+        themeHexDigits = "";
+      } else {
+        const char* keys = "0123456789ABCDEF";
+        for (int i = 0; i < 16; i++) {
+          int kx = 17 + (i % 8) * 57;
+          int ky = 165 + (i / 8) * 40;
+          if (hit(x, y, kx, ky, 51, 34)) {
+            if (themeHexDigits.length() < 6) {
+              themeHexDigits += keys[i];
+              if (themeHexDigits.length() == 6) {
+                uint32_t value = strtoul(themeHexDigits.c_str(), nullptr, 16);
+                if (themeEditTarget == 0) editBgRgb = value;
+                else editTextRgb = value;
+              }
+            }
+            break;
+          }
+        }
+      }
+    }
+    pageDirty = true;
+    return;
+  }
+
+  // Ereignismeldungen: zwei Kanaele, je Typ separat schaltbar.
+  if (currentPage == PAGE_NOTIFICATIONS) {
+    if (hit(x, y, 12, 260, 128, 49)) {
+      currentPage = PAGE_DISPLAY_SETTINGS;
+    } else if (hit(x, y, 152, 260, 145, 49)) {
+      noticePage ^= 1;
+    } else if (hit(x, y, 310, 260, 158, 49)) {
+      noticeDisplayMask = pendingNoticeDisplayMask;
+      noticeWebMask = pendingNoticeWebMask;
+      saveV18Settings();
+      currentPage = PAGE_DISPLAY_SETTINGS;
+      logEvent("V1.0.0 Meldungseinstellungen gespeichert (LCD/Web)");
+    } else {
+      for (uint8_t row = 0; row < 4; ++row) {
+        uint8_t i = noticePage * 4 + row;
+        if (i >= N_COUNT) break;
+        int yy = 77 + row * 42;
+        if (hit(x, y, 302, yy, 72, 33))
+          pendingNoticeDisplayMask ^= (1U << i);
+        if (hit(x, y, 389, yy, 72, 33))
+          pendingNoticeWebMask ^= (1U << i);
+      }
+    }
+    pageDirty = true;
+    return;
+  }
+  if (currentPage == PAGE_STATS) {
+    if (hit(x, y, 12, 264, 456, 46)) currentPage = PAGE_PRINT_ARCHIVE;
+    pageDirty = true;
+    return;
+  }
+
+  // ANZEIGE-EINSTELLUNGEN: Aenderungen erst beim Speichern.
+  if (currentPage == PAGE_DISPLAY_SETTINGS) {
+    if (hit(x, y, 270, 49, 54, 34))
+      pendingBrightness = (uint8_t)max(10, (int)pendingBrightness - 5);
+    else if (hit(x, y, 404, 49, 54, 34))
+      pendingBrightness = (uint8_t)min(100, (int)pendingBrightness + 5);
+    else if (hit(x, y, 270, 102, 54, 36))
+      pendingTimeoutChoice = pendingTimeoutChoice == 0 ? 4 : pendingTimeoutChoice - 1;
+    else if (hit(x, y, 404, 102, 54, 36))
+      pendingTimeoutChoice = (pendingTimeoutChoice + 1) % 5;
+    else if (hit(x, y, 331, 143, 125, 32)) {
+      pendingDarkMode = !pendingDarkMode;
+      updatePendingColorDefaults();
+    } else if (hit(x, y, 265, 178, 91, 32))
+      pendingNotifications = !pendingNotifications;
+    else if (hit(x, y, 365, 178, 91, 32)) {
+      pendingNoticeDisplayMask = noticeDisplayMask;
+      pendingNoticeWebMask = noticeWebMask;
+      noticePage = 0;
+      currentPage = PAGE_NOTIFICATIONS;
+      pageDirty = true;
+      return;
+    } else if (hit(x, y, 268, 214, 188, 34)) {
+      openThemeColors();
+      return;
+    } else if (hit(x, y, 12, 258, 213, 52)) {
+      currentPage = PAGE_SYSTEM;
+      pageDirty = true;
+      return;
+    } else if (hit(x, y, 244, 258, 224, 52)) {
+      saveDisplayPrefs();
+      return;
+    }
+    pageDirty = true;
+    return;
+  }
+
+  if (currentPage == PAGE_SYSTEM_DETAILS) {
+    if (hit(x, y, 12, 258, 456, 52)) {
+      currentPage = PAGE_SYSTEM;
+    } else if (systemDetailsType == 3 && hit(x, y, 314, 198, 140, 39)) {
+      tareScale();
+    }
+    pageDirty = true;
+    return;
+  }
+
+  if (currentPage == PAGE_RESTART_CONFIRM) {
+    if (hit(x, y, 18, 212, 211, 67)) {
+      currentPage = PAGE_SYSTEM;
+      pageDirty = true;
+    } else if (hit(x, y, 251, 212, 211, 67)) {
+      ESP.restart();
+    }
+    return;
+  }
+
+  // DRUCKARCHIV aus dem DRUCK-Menue
+  if (currentPage == PAGE_PRINT_ARCHIVE) {
+    if (hit(x, y, 351, 8, 117, 35)) {
+      currentPage = PAGE_STATS;
+    } else if (hit(x, y, 12, 262, 128, 49)) {
+      currentPage = PAGE_PRINT;
+    } else if (hit(x, y, 164, 262, 144, 49)) {
+      printArchiveOffset = max(0, printArchiveOffset - 4);
+    } else if (hit(x, y, 331, 262, 137, 49)) {
+      if (printArchiveOffset + 4 < historyCount) printArchiveOffset += 4;
+    }
+    pageDirty = true;
+    return;
+  }
+
+  // HAUPTNAVIGATION: 5 Menuepunkte zu je 96 px.
+  if (y >= 266) {
+    int selected = x / 96;
+    if (selected >= 0 && selected <= 4) {
+      currentPage = (Page)selected;
+      pageDirty = true;
+    }
+    return;
+  }
+
+  // PROFILE - kein weiterer SYSTEM-Knopf (SYSTEM ist unten im Hauptmenue).
+  if (currentPage == PAGE_PROFILE) {
+    if (hit(x, y, 10, 193, 140, 60)) {
+      changeProfile(-1);
+    } else if (hit(x, y, 160, 193, 140, 60)) {
+      changeProfile(1);
+    } else if (hit(x, y, 310, 193, 160, 60)) {
+      openColorMenu();
+    }
+  }
+
+  // DRUCK
+  if (currentPage == PAGE_PRINT) {
+    if (hit(x, y, 350, 55, 110, 23)) {
+      printArchiveOffset = 0;
+      currentPage = PAGE_PRINT_ARCHIVE;
+      pageDirty = true;
+      return;
+    }
+    if (hit(x, y, 259, 182, 96, 62)) {
+      startPrint(false);
+    } else if (hit(x, y, 365, 182, 96, 62)) {
+      stopPrint();
+    }
+  }
+
+  // SYSTEM: Acht Karten wie in der Vorschau.
+  if (currentPage == PAGE_SYSTEM) {
+    for (int i = 0; i < 8; i++) {
+      int col = i % 4, row = i / 4;
+      if (!hit(x, y, 10 + col * 116, 60 + row * 95, 106, 82)) continue;
+      if (i == 0) openDisplaySettings();
+      else if (i == 1) { currentPage = PAGE_BAMBU; pageDirty = true; }
+      else if (i == 2) openBambuOptions();
+      else if (i == 7) { currentPage = PAGE_RESTART_CONFIRM; pageDirty = true; }
+      else {
+        systemDetailsType = (uint8_t)(i - 3);
+        currentPage = PAGE_SYSTEM_DETAILS;
+        pageDirty = true;
+      }
+      return;
+    }
+  }
+}
+
+// =====================================================
+// 29. HTML-GRUNDGERUEST
+// =====================================================
+
+String htmlHead(String title) {
+  String s;
+  s.reserve(5500);
+
+  s += "<!DOCTYPE html>";
+  s += "<html lang='de'><head>";
+  s += "<meta charset='utf-8'>";
+  s += "<meta name='viewport' ";
+  s += "content='width=device-width,initial-scale=1'>";
+  s += "<title>";
+  s += escapeHTML(title);
+  s += "</title>";
+
+  s += R"HTML(
+<style>
+:root{
+ --bg:#101820;
+ --panel:#20303c;
+ --field:#111c25;
+ --line:#384b59;
+ --text:#f3f7fb;
+ --muted:#aabac6;
+ --blue:#2684c7;
+ --green:#38d9a9;
+}
+*{box-sizing:border-box}
+body{
+ margin:0;
+ padding:18px;
+ background:var(--bg);
+ color:var(--text);
+ font-family:Arial,sans-serif;
+}
+main{
+ max-width:930px;
+ margin:auto;
+}
+h1{font-size:26px}
+h2{font-size:19px;margin-top:0}
+h3{font-size:16px}
+nav{
+ display:flex;
+ flex-wrap:wrap;
+ gap:6px;
+ margin-bottom:15px;
+}
+a{color:#74c9ff}
+.card{
+ background:var(--panel);
+ border-radius:14px;
+ padding:18px;
+ margin:12px 0;
+}
+.grid{
+ display:grid;
+ grid-template-columns:repeat(
+  auto-fit,minmax(210px,1fr)
+ );
+ gap:12px;
+}
+.value{
+ font-size:35px;
+ font-weight:bold;
+ color:var(--green);
+}
+.muted{color:var(--muted)}
+.small{font-size:13px}
+input,select{
+ width:100%;
+ padding:12px;
+ margin:7px 0 13px;
+ border:1px solid var(--line);
+ border-radius:8px;
+ background:var(--field);
+ color:white;
+}
+input[type=color]{
+ height:55px;
+ padding:4px;
+ cursor:pointer;
+}
+button,.link{
+ display:inline-block;
+ border:0;
+ border-radius:8px;
+ padding:11px 15px;
+ margin:4px 3px 4px 0;
+ background:var(--blue);
+ color:white;
+ text-decoration:none;
+ cursor:pointer;
+}
+.ok{background:#247e58}
+.danger{background:#ac404b}
+.progress{
+ width:100%;
+ height:14px;
+ background:#12212b;
+ border-radius:9px;
+ overflow:hidden;
+}
+.fill{
+ height:100%;
+ width:0%;
+ background:var(--green);
+}
+table{
+ width:100%;
+ border-collapse:collapse;
+}
+th,td{
+ padding:10px;
+ text-align:left;
+ border-bottom:1px solid var(--line);
+}
+.scroll{overflow-x:auto}
+pre{
+ white-space:pre-wrap;
+ overflow-wrap:anywhere;
+ font-size:12px;
+}
+</style>
+</head><body><main>
+)HTML";
+
+  s += "<h1>Filamentwaage V1.0.0</h1>";
+  s += "<nav>";
+
+  const char* paths[] = {
+    "/",
+    "/profiles",
+    "/printer",
+    "/history",
+    "/console",
+    "/notifications",
+    "/settings"
+  };
+
+  const char* labels[] = {
+    "Waage",
+    "Filamentprofile",
+    "Bambu Lab",
+    "Druckarchiv",
+    "Konsole",
+    "Meldungen",
+    "System"
+  };
+
+  for (int i = 0; i < 7; i++) {
+    s += "<a class='link' href='";
+    s += paths[i];
+    s += "'>";
+    s += labels[i];
+    s += "</a>";
+  }
+
+  s += "</nav>";
+  s += "<div id='fwToast' role='status' style='display:none;padding:12px;background:#284653;";
+  s += "border-radius:9px;margin:10px 0'></div>";
+  return s;
+}
+
+String htmlFoot() {
+  return R"HTML(<script>
+  (function(){let seq=null;let hide=null;
+    async function check(){try{
+      const r=await fetch('/api/notices',{cache:'no-store'});
+      if(!r.ok)return;
+      const d=await r.json();
+      if(seq!==null && d.sequence>seq && d.events.length){
+        const e=d.events[0];
+        const el=document.getElementById('fwToast');
+        el.textContent=e.date+' | '+e.message;
+        el.style.display='block';
+        clearTimeout(hide);hide=setTimeout(()=>el.style.display='none',6500);
+      }
+      seq=d.sequence;
+    }catch(err){}}
+    check();setInterval(check,4000);
+  })();
+  </script></main></body></html>)HTML";
+}
+
+// =====================================================
+// 30. WEBSEITE: WAAGE
+// =====================================================
+
+void pageHome() {
+  String s = htmlHead("Waage");
+
+  s += "<div class='card'><h2>Zusaetzlicher Gewichtsabzug</h2>";
+  s += "<p class='muted small'>Wird vom angezeigten Gesamtgewicht abgezogen, "
+       "zusaetzlich zum Spulenleergewicht des aktiven Profils. "
+       "Messung, Tara und Druckverbrauch bleiben unveraendert.</p>";
+  s += "<form method='post' action='/weight/deduction'>";
+  s += "<label>Abzug in Gramm (0 = kein Abzug)</label>";
+  s += "<input name='deduct' type='number' min='0' max='5000' "
+       "step='0.1' required value='" + String(manualDeductionGrams, 1) + "'>";
+  s += "<button class='ok'>Gewichtsabzug speichern</button></form>";
+  s += "<p class='muted small'>Wert bleibt nach einem Neustart gespeichert.</p></div>";
+
+  s += R"HTML(
+<div class="grid">
+ <div class="card">
+  <h2>Gesamtgewicht</h2>
+  <div class="value" id="weight">-- g</div>
+  <p class="muted" id="stable">Messung...</p>
+ </div>
+
+ <div class="card">
+  <h2>Restfilament</h2>
+  <div class="value" id="rest">-- g</div>
+  <p id="profile">--</p>
+ </div>
+
+ <div class="card">
+  <h2>Fuellstand</h2>
+  <div class="value" id="percent">-- %</div>
+  <div class="progress">
+   <div class="fill" id="fill"></div>
+  </div>
+ </div>
+</div>
+
+<div class="card">
+ <h2>Bambu Lab</h2>
+ <p>Status: <b id="bambu">--</b></p>
+ <p>Modell: <b id="job">--</b></p>
+ <p>Fortschritt:
+ <b id="progress">--</b>%</p>
+ <p>Restzeit:
+ <b id="remaining">--</b></p>
+</div>
+
+<div class="card">
+ <h2>Reicht das Filament?</h2>
+ <p>Erwarteter Verbrauch:</p>
+
+ <form method="post" action="/estimate">
+  <input name="grams" type="number"
+   min="0" max="5000" step="0.1"
+   placeholder="z.B. 120">
+  <button>Pruefen</button>
+ </form>
+
+ <p>Ergebnis: <b id="enough">--</b></p>
+</div>
+
+<div class="card">
+ <h2>Druckverbrauch</h2>
+ <p>Messung: <b id="printing">--</b></p>
+ <p>Verbrauch: <b id="used">-- g</b></p>
+ <p>Hybridmessung: <b id="hybrid">--</b></p>
+ <p>Filamentkosten: <b id="cost">-- EUR</b></p>
+
+ <form method="post" action="/print/start">
+  <button class="ok">Druck starten</button>
+ </form>
+
+ <form method="post" action="/print/stop">
+  <button class="danger">Druck stoppen</button>
+ </form>
+</div>
+
+<script>
+async function refresh(){
+ try{
+  const r=await fetch('/api',{cache:'no-store'});
+
+  if(!r.ok)return;
+
+  const d=await r.json();
+
+  const set=(id,value)=>{
+   document.getElementById(id).textContent=value;
+  };
+
+  set('weight',d.weight.toFixed(1)+' g');
+  set('rest',d.rest.toFixed(1)+' g');
+  set('percent',d.percent.toFixed(0)+' %');
+
+  set('profile',d.profile);
+  set('stable',d.stable?'Stabil':'Messung laeuft');
+
+  document.getElementById('fill')
+   .style.width=d.percent+'%';
+
+  document.getElementById('fill')
+   .style.background=d.rgb;
+
+  set('bambu',d.bambu);
+  set('job',d.job||'-');
+  set('progress',d.progress);
+  set('remaining',d.remaining_text);
+
+  set('enough',d.enough);
+
+  set('printing',d.printing?'Aktiv':'Inaktiv');
+  set('used',d.used.toFixed(1)+' g'+(d.hybrid_provisional?' (vorlaeufig)':''));
+  set('hybrid',d.hybrid_status);
+  set('cost',d.cost_eur.toFixed(2)+' EUR');
+
+ }catch(e){}
+}
+refresh();
+setInterval(refresh,1200);
+</script>
+)HTML";
+
+  s += htmlFoot();
+
+  server.send(200, "text/html", s);
+}
+
+// =====================================================
+// 31. WEBSEITE: FILAMENTPROFILE
+// =====================================================
+
+void pageProfiles() {
+  String s = htmlHead("Filamentprofile");
+
+  s += "<div class='card'>";
+  s += "<h2>Gespeicherte Profile</h2>";
+
+  for (int i = 0; i < profileCount; i++) {
+    s += "<div style='padding:10px 0'>";
+
+    s += "<span style='display:inline-block;";
+    s += "width:19px;height:19px;";
+    s += "border-radius:5px;";
+    s += "vertical-align:middle;";
+    s += "background:";
+    s += colorHex(profiles[i].rgb);
+    s += "'></span> ";
+
+    s += "<b>";
+    s += escapeHTML(profiles[i].name);
+    s += " ";
+    s += escapeHTML(profiles[i].material);
+    s += "</b>";
+
+    if (i == activeProfile) {
+      s += " (aktiv)";
+    }
+
+    s += "<p class='muted small'>";
+    s += "Leergewicht: ";
+    s += String(profiles[i].emptyWeight, 1);
+    s += " g | Voll: ";
+    s += String(profiles[i].fullWeight, 1);
+    s += " g | Preis: ";
+    s += String(profiles[i].priceKg, 2);
+    s += " EUR/kg | RGB: ";
+    s += colorHex(profiles[i].rgb);
+    s += "</p>";
+
+    s += "<a class='link' href='/profiles?edit=";
+    s += String(i);
+    s += "'>Bearbeiten</a>";
+
+    s += "<form method='post' ";
+    s += "action='/profile/select' ";
+    s += "style='display:inline'>";
+
+    s += "<input type='hidden' name='id' value='";
+    s += String(i);
+    s += "'>";
+
+    s += "<button>Aktivieren</button>";
+    s += "</form>";
+
+    s += "</div><hr>";
+  }
+
+  s += "</div>";
+
+  int id = server.hasArg("edit")
+    ? server.arg("edit").toInt()
+    : -1;
+
+  bool editing =
+    id >= 0 && id < profileCount;
+
+  s += "<div class='card'>";
+
+  s += editing
+    ? "<h2>Profil bearbeiten</h2>"
+    : "<h2>Neues Profil anlegen</h2>";
+
+  s += "<form method='post' action='/profile/save'>";
+
+  s += "<input type='hidden' name='id' value='";
+  s += String(editing ? id : -1);
+  s += "'>";
+
+  s += "<label>Hersteller / Name</label>";
+  s += "<input name='name' maxlength='32' required value='";
+
+  if (editing) {
+    s += escapeHTML(profiles[id].name);
+  }
+
+  s += "'>";
+
+  s += "<label>Material</label>";
+  s += "<select name='material'>";
+
+  const char* materials[] = {
+    "PLA", "PETG", "ABS", "ASA",
+    "TPU", "PA", "PC", "OTHER"
+  };
+
+  for (int i = 0; i < 8; i++) {
+    String mat = materials[i];
+
+    s += "<option value='" + mat + "'";
+
+    if (
+      editing &&
+      profiles[id].material == mat
+    ) {
+      s += " selected";
+    }
+
+    s += ">" + mat + "</option>";
+  }
+
+  s += "</select>";
+
+  s += "<label>Leergewicht der Spule (g)</label>";
+
+  s += "<input type='number' name='empty' ";
+  s += "min='0' max='5000' step='0.1' required value='";
+
+  s += String(
+    editing
+      ? profiles[id].emptyWeight
+      : 170.0f,
+    1
+  );
+
+  s += "'>";
+
+  s += "<label>Volle Filamentmenge (g)</label>";
+
+  s += "<input type='number' name='full' ";
+  s += "min='1' max='5000' step='0.1' required value='";
+
+  s += String(
+    editing
+      ? profiles[id].fullWeight
+      : 1000.0f,
+    1
+  );
+
+  s += "'>";
+
+  s += "<label>Filamentpreis pro kg (EUR)</label>";
+  s += "<input type='number' name='price' min='0' max='1000' step='0.01' required value='";
+  s += String(editing ? profiles[id].priceKg : 0.0f, 2);
+  s += "'>";
+
+  s += "<h3>RGB-Farbe</h3>";
+  s += "<label>Farbwaehler</label>";
+
+  s += "<input type='color' id='picker' name='color' value='";
+
+  s += colorHex(
+    editing
+      ? profiles[id].rgb
+      : 0x21C5FF
+  );
+
+  s += "'>";
+
+  s += "<label>RGB-Hexwert</label>";
+  s += "<input id='hex' maxlength='7' value='";
+
+  s += colorHex(
+    editing
+      ? profiles[id].rgb
+      : 0x21C5FF
+  );
+
+  s += "'>";
+
+  s += R"HTML(
+<script>
+const picker=document.getElementById('picker');
+const hex=document.getElementById('hex');
+
+picker.addEventListener('input',()=>{
+ hex.value=picker.value.toUpperCase();
+});
+
+hex.addEventListener('change',()=>{
+ if(/^#[0-9A-Fa-f]{6}$/.test(hex.value)){
+  picker.value=hex.value;
+ }
+});
+</script>
+)HTML";
+
+  s += "<button class='ok'>";
+  s += "Profil speichern";
+  s += "</button>";
+  s += "</form>";
+
+  if (editing && profileCount > 1) {
+    s += "<form method='post' action='/profile/delete'>";
+
+    s += "<input type='hidden' name='id' value='";
+    s += String(id);
+    s += "'>";
+
+    s += "<button class='danger'>";
+    s += "Profil loeschen";
+    s += "</button>";
+    s += "</form>";
+  }
+
+  s += "</div>";
+  s += htmlFoot();
+
+  server.send(200, "text/html", s);
+}
+
+// =====================================================
+// 32. WEB-PROFILE SPEICHERN
+// =====================================================
+
+void saveProfileWeb() {
+  float price = server.arg("price").toFloat();
+  if (!server.hasArg("price") || !isfinite(price) || price < 0 || price > 1000) {
+    server.send(400, "text/plain", "Ungueltiger Filamentpreis");
+    return;
+  }
+  int id = server.arg("id").toInt();
+
+  if (id < 0 || id >= profileCount) {
+    if (profileCount >= MAX_PROFILES) {
+      server.send(
+        400,
+        "text/plain",
+        "Maximal 8 Profile"
+      );
+      return;
+    }
+
+    id = profileCount++;
+  }
+
+  String name = server.arg("name");
+  name.trim();
+
+  if (name.isEmpty()) {
+    name = "Filament";
+  }
+
+  profiles[id].name =
+    name.substring(0, 32);
+
+  profiles[id].material =
+    server.arg("material");
+
+  profiles[id].emptyWeight = clampFloat(
+    server.arg("empty").toFloat(),
+    0,
+    5000
+  );
+
+  profiles[id].fullWeight = clampFloat(
+    server.arg("full").toFloat(),
+    1,
+    5000
+  );
+
+  profiles[id].rgb =
+    readHexColor(server.arg("color"));
+  profiles[id].priceKg = price;
+
+  saveProfiles();
+  pageDirty = true;
+
+  logEvent(
+    "Profil gespeichert: " +
+    profiles[id].name
+  );
+
+  redirect("/profiles");
+}
+
+void selectProfileWeb() {
+  int id = server.arg("id").toInt();
+
+  if (id >= 0 && id < profileCount) {
+    activeProfile = id;
+
+    prefs.putUInt(
+      "pa",
+      activeProfile
+    );
+
+    pageDirty = true;
+  }
+
+  redirect("/profiles");
+}
+
+void deleteProfileWeb() {
+  int id = server.arg("id").toInt();
+
+  if (
+    id < 0 ||
+    id >= profileCount ||
+    profileCount <= 1
+  ) {
+    server.send(
+      400,
+      "text/plain",
+      "Ungueltig"
+    );
+    return;
+  }
+
+  for (int i = id; i < profileCount - 1; i++) {
+    profiles[i] = profiles[i + 1];
+  }
+
+  profileCount--;
+
+  if (activeProfile >= profileCount) {
+    activeProfile = profileCount - 1;
+  }
+
+  saveProfiles();
+  pageDirty = true;
+
+  redirect("/profiles");
+}
+
+// =====================================================
+// 33. WEBSEITE: BAMBU CLOUD
+// =====================================================
+
+void pageBambu() {
+  String s = htmlHead("Bambu Lab");
+
+  s += "<div class='card'>";
+  s += "<h2>Bambu Lab Cloud</h2>";
+
+  s += "<p>Status: <b>";
+  s += escapeHTML(bambuState);
+  s += "</b></p>";
+
+  s += "<p>Modell: ";
+  s += escapeHTML(bambuJob);
+  s += "</p>";
+
+  s += "<p>Fortschritt: ";
+  s += String(bambuProgress);
+  s += " %</p>";
+
+  s += "<p>Restzeit: ";
+  s += bambuRemainingText(bambuRemaining);
+  s += "</p>";
+
+  s += "<p>Filamentanzeige: <b>";
+  s += bambuViewName(bambuViewMode);
+  s += "</b></p>";
+  if (bambuViewMode == 0 || bambuViewMode == 2) {
+    s += "<h3>AMS Lite</h3>";
+    for (int i = 0; i < 4; i++) {
+      s += "<p>Platz " + String(i + 1) + ": " +
+        escapeHTML(slotMaterial(amsSlots[i]));
+      if (amsSlots[i].colorKnown) s += " / " + colorHex(amsSlots[i].color);
+      s += "</p>";
+    }
+  }
+  if (bambuViewMode == 1 || bambuViewMode == 2) {
+    s += "<h3>Externe Spule</h3><p>" + escapeHTML(slotMaterial(externalSlot));
+    if (externalSlot.colorKnown) s += " / " + colorHex(externalSlot.color);
+    s += "</p><p>Waagenwert (aktives Profil): ";
+    s += zeroValid && hxReady ? String(restGrams, 1) + " g" : "--";
+    s += "</p>";
+  }
+  s += "<p class='muted'>";
+  s += "SN, Token und UID werden direkt ";
+  s += "im Arduino-Code eingetragen.";
+  s += "</p>";
+
+  s += "</div>";
+  s += htmlFoot();
+
+  server.send(200, "text/html", s);
+}
+
+// =====================================================
+// 34. WEBSEITE: SYSTEM
+// =====================================================
+
+void pageSettings() {
+  String s = htmlHead("System");
+
+  s += "<div class='card'>";
+  s += "<h2>Heim-WLAN</h2>";
+
+  s += "<p>Status: ";
+  s += WiFi.status() == WL_CONNECTED
+    ? "Verbunden"
+    : "Nicht verbunden";
+  s += "</p>";
+
+  s += "<p>WLAN: ";
+  s += escapeHTML(String(WIFI_SSID));
+  s += "</p>";
+
+  s += "<p>IP-Adresse: ";
+  s += currentIP();
+  s += "</p>";
+
+  s += "</div>";
+
+  s += "<div class='card'>";
+  s += "<h2>Bambu-Anzeige</h2>";
+  s += "<p>Welche Filamentquellen im BAMBU-Menue zeigen?</p>";
+  s += "<form method='post' action='/bambu/view'>";
+  s += "<select name='mode'>";
+  for (int i = 0; i < 3; i++) {
+    s += "<option value='" + String(i) + "'";
+    if (bambuViewMode == i) s += " selected";
+    s += ">" + bambuViewName(i) + "</option>";
+  }
+  s += "</select><button class='ok'>Anzeigemodus speichern</button>";
+  s += "</form></div>";
+
+  s += "<div class='card'><h2>Anzeige-Einstellungen</h2>";
+  s += "<form method='post' action='/display/save'>";
+  s += "<label>Helligkeit (10 bis 100 %)</label>";
+  s += "<input name='brightness' type='number' min='10' max='100' value='";
+  s += String(displayBrightness);
+  s += "'>";
+  s += "<label>Display-Timeout</label><select name='timeout'>";
+  for (int i = 0; i < 5; i++) {
+    s += "<option value='" + String(i) + "'";
+    if (displayTimeoutChoice == i) s += " selected";
+    s += ">" + timeoutLabel(i) + "</option>";
+  }
+  s += "</select>";
+  s += "<label><input name='dark' type='checkbox' value='1' style='width:auto'";
+  if (displayDarkMode) s += " checked";
+  s += "> Dunkelmodus</label>";
+  s += "<label><input name='notice' type='checkbox' value='1' style='width:auto'";
+  if (displayNotifications) s += " checked";
+  s += "> Statusbenachrichtigungen</label>";
+  s += "<h3>Eigene Hintergrund- und Schriftfarbe</h3>";
+  s += "<label><input type='checkbox' name='custom' id='customCol' value='1' style='width:auto'";
+  if (customColorsEnabled) s += " checked";
+  s += "> Eigene Farben aktivieren (sonst Hell-/Dunkelmodus)</label>";
+  s += "<label>Hintergrundfarbe</label><input type='color' name='bgcolor' id='bgcolor' value='";
+  s += colorHex(customColorsEnabled ? customBgRgb : defaultBackgroundRgb(displayDarkMode));
+  s += "'>";
+  s += "<label>Hintergrund HEX (#RRGGBB)</label><input id='bghex' maxlength='7' value='";
+  s += colorHex(customColorsEnabled ? customBgRgb : defaultBackgroundRgb(displayDarkMode));
+  s += "'>";
+  s += "<label>Schriftfarbe</label><input type='color' name='textcolor' id='textcolor' value='";
+  s += colorHex(customColorsEnabled ? customTextRgb : defaultTextRgb(displayDarkMode));
+  s += "'>";
+  s += "<label>Schrift HEX (#RRGGBB)</label><input id='texthex' maxlength='7' value='";
+  s += colorHex(customColorsEnabled ? customTextRgb : defaultTextRgb(displayDarkMode));
+  s += "'>";
+  s += R"HTML(
+  <h3>12 voreingestellte Farben</h3>
+  <label>Farbe anwenden auf</label>
+  <select id='themeTarget'><option value='bg'>Hintergrund</option>
+  <option value='text'>Schriftfarbe</option></select>
+  <div id='themePalette' style='display:grid;grid-template-columns:repeat(6,1fr);gap:7px'></div>
+  <p class='small muted'>Eigene HEX-Codes sind moeglich. Bei zu geringem Kontrast wird nicht gespeichert.</p>
+  <script>
+  const palette=['#FF3B30','#FF9500','#FFCC00','#30D158',
+    '#00C7BE','#0A84FF','#5E5CE6','#BF5AF2',
+    '#FFFFFF','#AAAAAA','#222222','#FF69B4'];
+  const customCheck=document.getElementById('customCol');
+  const colorFields=[['bgcolor','bghex'],['textcolor','texthex']];
+  for(const [pickerId,hexId] of colorFields){
+    const picker=document.getElementById(pickerId);
+    const hex=document.getElementById(hexId);
+    picker.addEventListener('input',()=>{
+      hex.value=picker.value.toUpperCase();
+      customCheck.checked=true;
+    });
+    hex.addEventListener('input',()=>{
+      const val=hex.value.trim().toUpperCase();
+      if(/^#[0-9A-F]{6}$/.test(val)){
+        picker.value=val;
+        customCheck.checked=true;
+      }
+    });
+    hex.addEventListener('change',()=>{
+      if(!/^#[0-9A-Fa-f]{6}$/.test(hex.value.trim())){
+        hex.value=picker.value.toUpperCase();
+      }
+    });
+  }
+  const pbox=document.getElementById('themePalette');
+  for(const hex of palette){
+    const btn=document.createElement('button');
+    btn.type='button';btn.title=hex;
+    btn.style='background:'+hex+';height:38px;border:1px solid #9ca3af;padding:0';
+    btn.addEventListener('click',()=>{
+      const target=document.getElementById('themeTarget').value;
+      document.getElementById(target==='bg'?'bgcolor':'textcolor').value=hex;
+      document.getElementById(target==='bg'?'bghex':'texthex').value=hex;
+      customCheck.checked=true;
+    });
+    pbox.appendChild(btn);
+  }
+  </script>)HTML";
+  s += "<button class='ok'>Display-Einstellungen speichern</button></form></div>";
+
+  s += "<div class='card'><h2>Hybridmessung und Filamentwarnung</h2>";
+  s += "<p>Vorlaeufige Live-Werte, Stoerungserkennung und stabile Endmessung sind aktiv.</p>";
+  s += "<form method='post' action='/warning/save'>";
+  s += "<label>Warnschwelle Restfilament (g, 0 = aus)</label>";
+  s += "<input type='number' name='low' min='0' max='5000' step='1' required value='";
+  s += String(lowFilamentThreshold, 0) + "'>";
+  s += "<button class='ok'>Warnschwelle speichern</button></form></div>";
+  s += "<div class='card'><h2>Benachrichtigungen</h2>";
+  s += "<p>Alle Meldungen fuer LCD und Browser getrennt steuern.</p>";
+  s += "<a class='link' href='/notifications'>Meldungen einstellen</a></div>";
+  s += "<div class='card'><h2>Datensicherung</h2>";
+  s += "<p>Filamentprofile, Archiv, Preise, Anzeige- und Meldungseinstellungen sichern.</p>";
+  s += "<a class='link' href='/backup'>Backup als JSON herunterladen</a>";
+  s += "<p class='small muted'>Bei Wiederherstellung bleibt der aktuelle Nullpunkt standardmaessig erhalten.</p>";
+  s += R"HTML(<input id='restoreFile' type='file' accept='.json,application/json'>
+  <label><input type='checkbox' id='restoreZero' style='width:auto'>
+  Auch Nullpunkt aus Backup uebernehmen (nur auf demselben Geraet)</label>
+  <button type='button' class='danger' onclick='restoreBackup()'>Backup wiederherstellen</button>
+  <p id='restoreInfo' class='small'></p>
+  <script>
+  async function restoreBackup(){
+    const f=document.getElementById('restoreFile').files[0];
+    if(!f){alert('Bitte zuerst Backup-Datei waehlen.');return;}
+    const body=await f.text();
+    try{const b=JSON.parse(body);if(b.format!=='filamentwaage-backup')throw 1;}
+    catch(e){alert('Ungueltiges Filamentwaage-Backup.');return;}
+    if(!confirm('Aktuelle Profile, Archiv und Einstellungen durch Backup ersetzen?'))return;
+    const zero=document.getElementById('restoreZero').checked?'1':'0';
+    const r=await fetch('/restore?zero='+zero,{
+      method:'POST',headers:{'Content-Type':'application/json'},body:body});
+    const t=await r.text();
+    document.getElementById('restoreInfo').textContent=t;
+    if(r.ok)location.reload();
+  }
+  </script>)HTML";
+  s += "</div>";
+
+  s += "<div class='card'>";
+  s += "<h2>Waage</h2>";
+
+  s += "<p>Kalibrierung: ";
+  s += "<b>-365.0 FIX</b></p>";
+
+  s += "<p>Nullpunkt: ";
+  s += String(zeroOffset);
+  s += "</p>";
+
+  s += "<p>Rohwert: ";
+  s += String(rawValue);
+  s += "</p>";
+
+  s += "<p>Stabil: ";
+  s += stable ? "Ja" : "Nein";
+  s += "</p>";
+
+  s += "<form method='post' action='/tare'>";
+  s += "<button>";
+  s += "Leere Waage tarieren";
+  s += "</button>";
+  s += "</form>";
+
+  s += "</div>";
+  s += htmlFoot();
+
+  server.send(200, "text/html", s);
+}
+
+// =====================================================
+// 35. WEBSEITE: DRUCKARCHIV
+// =====================================================
+
+void pageHistory() {
+  String s = htmlHead("Druckarchiv");
+
+  float totalUsed = 0;
+  float totalCost = 0;
+  int confirmedCount = 0;
+  for (int i = 0; i < historyCount; i++) {
+    totalUsed += historyItems[i].used;
+    totalCost += historyItems[i].cost;
+    if (historyItems[i].confirmed) confirmedCount++;
+  }
+
+  s += "<div class='grid'>";
+
+  s += "<div class='card'>";
+  s += "<h2>Drucke</h2>";
+  s += "<div class='value'>";
+  s += String(historyCount);
+  s += "</div></div>";
+
+  s += "<div class='card'>";
+  s += "<h2>Gesamtverbrauch</h2>";
+  s += "<div class='value'>";
+  s += String(totalUsed, 1);
+  s += " g</div></div>";
+
+  s += "</div>";
+  s += "<div class='card'><h2>Kosten / Endmessungen (letzte 12 Drucke)</h2>";
+  s += "<p>Gesamtkosten: <b>" + String(totalCost, 2) + " EUR</b></p>";
+  s += "<p>Durchschnittsverbrauch: <b>" + String(historyCount ? totalUsed / historyCount : 0, 1) + " g</b></p>";
+  s += "<p>Bestaetigte Hybrid-Endmessungen: <b>" + String(confirmedCount) + "</b></p>";
+  s += "<p class='small muted'>Das Archiv speichert bis zu 12 Drucke; keine unbegrenzte Lebenszeitstatistik.</p></div>";
+
+  s += "<div class='card'>";
+  s += "<h2>Druckarchiv</h2>";
+
+  s += "<a class='link' href='/history.csv'>";
+  s += "CSV herunterladen";
+  s += "</a>";
+
+  s += "<div class='scroll'><table>";
+
+  s += "<tr>";
+  s += "<th>Datum</th>";
+  s += "<th>Modell</th>";
+  s += "<th>Filament</th>";
+  s += "<th>Verbrauch</th>";
+  s += "<th>Dauer</th><th>Kosten</th><th>Messung</th>";
+  s += "</tr>";
+
+  for (int i = 0; i < historyCount; i++) {
+    s += "<tr><td>";
+    s += escapeHTML(historyItems[i].date);
+
+    s += "</td><td>";
+    s += escapeHTML(historyItems[i].name);
+
+    s += "</td><td>";
+    s += escapeHTML(historyItems[i].filament);
+
+    s += "</td><td>";
+    s += String(historyItems[i].used, 1);
+
+    s += " g</td><td>";
+    s += durationText(historyItems[i].seconds);
+    s += "</td><td>";
+    s += String(historyItems[i].cost, 2) + " EUR";
+    s += "</td><td>";
+    s += historyItems[i].confirmed ? "Bestaetigt" : "Vorlaeufig / Altbestand";
+    s += "</td></tr>";
+  }
+
+  s += "</table></div></div>";
+  s += htmlFoot();
+
+  server.send(200, "text/html", s);
+}
+
+// =====================================================
+// 36. CSV-EXPORT
+// =====================================================
+
+String csvSafe(String s) {
+  s.replace("\"", "\"\"");
+  return "\"" + s + "\"";
+}
+
+void downloadCSV() {
+  String csv;
+
+  csv += "Datum;Modell;Filament;";
+  csv += "Verbrauch_g;Startgewicht_g;";
+  csv += "Endgewicht_g;Dauer_s;Kosten_EUR;Endmessung_bestaetigt\n";
+
+  for (int i = 0; i < historyCount; i++) {
+    csv += csvSafe(historyItems[i].date) + ";";
+    csv += csvSafe(historyItems[i].name) + ";";
+    csv += csvSafe(historyItems[i].filament) + ";";
+    csv += String(historyItems[i].used, 2) + ";";
+    csv += String(historyItems[i].startWeight, 2) + ";";
+    csv += String(historyItems[i].endWeight, 2) + ";";
+    csv += String(historyItems[i].seconds) + ";";
+    csv += String(historyItems[i].cost, 2) + ";";
+    csv += historyItems[i].confirmed ? "ja" : "nein";
+    csv += "\n";
+  }
+
+  server.sendHeader(
+    "Content-Disposition",
+    "attachment; filename=druckarchiv.csv"
+  );
+
+  server.send(
+    200,
+    "text/csv; charset=utf-8",
+    csv
+  );
+}
+
+// =====================================================
+// 37. DIAGNOSEKONSOLE
+// =====================================================
+
+void pageConsole() {
+  String s = htmlHead("Diagnosekonsole");
+
+  s += "<div class='card'>";
+  s += "<h2>Diagnosekonsole</h2>";
+  s += "<pre>";
+
+  for (int i = 0; i < MAX_LOGS; i++) {
+    int index = (logNext + i) % MAX_LOGS;
+
+    if (logLines[index].length() > 0) {
+      s += escapeHTML(logLines[index]);
+      s += "\n";
+    }
+  }
+
+  s += "</pre></div>";
+  s += htmlFoot();
+
+  server.send(200, "text/html", s);
+}
+
+// =====================================================
+// 38. LIVE-API
+// =====================================================
+
+void pageAPI() {
+  JsonDocument doc;
+
+  doc["weight"] = displayedWeightGrams();
+  doc["deduction_g"] = manualDeductionGrams;
+  doc["rest"] = restGrams;
+  doc["percent"] = fillPercent;
+  doc["stable"] = stable;
+
+  doc["profile"] =
+    active().name + " " + active().material;
+
+  doc["rgb"] = colorHex(active().rgb);
+
+  doc["printing"] = printActive;
+  doc["used"] = printUsed;
+  doc["hybrid_status"] = hybridStatusLabel();
+  doc["hybrid_provisional"] = printActive || printEndPending;
+  doc["end_pending"] = printEndPending;
+  doc["measurement_disturbed"] = hybridDisturbed;
+  doc["last_confirmed"] = lastPrintConfirmed;
+  doc["cost_eur"] = printUsed * printPriceKg / 1000.0f;
+  doc["price_eur_kg"] = active().priceKg;
+  doc["low_warning_grams"] = lowFilamentThreshold;
+  doc["bambu_link"] = bambuConnected;
+  doc["bambu_data_age_s"] = lastBambuMessage ? (millis() - lastBambuMessage) / 1000 : -1;
+
+  doc["bambu"] = bambuState;
+  doc["job"] = bambuJob;
+  doc["progress"] = bambuProgress;
+  doc["remaining"] = bambuRemaining; // Minutenwert fuer bestehende API-Clients
+  doc["remaining_text"] = bambuRemainingText(bambuRemaining);
+  doc["bambu_view"] = bambuViewName(bambuViewMode);
+  doc["nozzle_temper"] = isfinite(bambuNozzleTemp) ? bambuNozzleTemp : 0;
+  doc["bed_temper"] = isfinite(bambuBedTemp) ? bambuBedTemp : 0;
+  doc["layer"] = bambuLayer;
+  doc["layers"] = bambuTotalLayers;
+
+  doc["enough"] = filamentEnough();
+
+  doc["raw"] = rawValue;
+  doc["zero"] = zeroOffset;
+  doc["factor"] = SCALE_FACTOR;
+
+  String json;
+  serializeJson(doc, json);
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+}
+
+// =====================================================
+// V1.8: MELDUNGEN IM BROWSER
+// =====================================================
+
+void pageNotifications() {
+  String s = htmlHead("Meldungen");
+  s += "<div class='card'><h2>Meldungen fuer LCD und Web einstellen</h2>";
+  s += "<p class='small muted'>Aenderungen sind nach Speichern sofort auch auf dem Touchdisplay aktiv.";
+  s += " Messungen und Ereignisprotokoll bleiben unabhaengig von der Anzeige aktiv.</p>";
+  s += "<form method='post' action='/notifications/save'><div class='scroll'><table>";
+  s += "<tr><th>Ereignis</th><th>LCD</th><th>Browser</th></tr>";
+  for (uint8_t i = 0; i < N_COUNT; ++i) {
+    String key = String(i);
+    s += "<tr><td>" + escapeHTML(String(noticeName((NoticeType)i))) + "</td><td>";
+    s += "<input type='checkbox' name='d" + key + "' style='width:auto'";
+    if (noticeDisplayMask & (1U << i)) s += " checked";
+    s += "></td><td><input type='checkbox' name='w" + key + "' style='width:auto'";
+    if (noticeWebMask & (1U << i)) s += " checked";
+    s += "></td></tr>";
+  }
+  s += "</table></div><button class='ok'>Meldungseinstellungen speichern</button></form></div>";
+  s += "<div class='card'><h2>Letzte Browsermeldungen</h2>";
+  if (!noticeCount) s += "<p>Noch keine Meldungen aufgetreten.</p>";
+  for (uint8_t i = 0; i < noticeCount; ++i) {
+    s += "<p><b>" + escapeHTML(noticeRecords[i].date) + "</b> - " +
+         escapeHTML(noticeRecords[i].message) + "</p>";
+  }
+  s += "<p class='small muted'>Nur Meldungen seit dem Einschalten; ein ausgeschalteter Browserkanal erzeugt keine Browsermeldung.</p></div>";
+  s += htmlFoot();
+  server.send(200, "text/html", s);
+}
+
+void pageNoticeAPI() {
+  JsonDocument d;
+  d["sequence"] = noticeSequence;
+  JsonArray a = d["events"].to<JsonArray>();
+  for (uint8_t i = 0; i < noticeCount && i < 8; ++i) {
+    JsonObject o = a.add<JsonObject>();
+    o["id"] = noticeRecords[i].id;
+    o["type"] = noticeName(noticeRecords[i].type);
+    o["message"] = noticeRecords[i].message;
+    o["date"] = noticeRecords[i].date;
+  }
+  String out;
+  serializeJson(d, out);
+  server.send(200, "application/json", out);
+}
+
+// =====================================================
+// V1.8: BACKUP, VERSIONIERT, OHNE PASSWOERTER/TOKENS
+// =====================================================
+
+void downloadBackup() {
+  JsonDocument doc;
+  doc["format"] = "filamentwaage-backup";
+  doc["version"] = "1.0.0";
+  doc["created"] = timestamp();
+  JsonObject st = doc["settings"].to<JsonObject>();
+  st["expected"] = expectedGrams;
+  st["deduct"] = manualDeductionGrams;
+  st["low"] = lowFilamentThreshold;
+  st["bview"] = bambuViewMode;
+  st["bright"] = displayBrightness;
+  st["timeout"] = displayTimeoutChoice;
+  st["dark"] = displayDarkMode;
+  st["notice"] = displayNotifications;
+  st["dmask"] = noticeDisplayMask;
+  st["wmask"] = noticeWebMask;
+  st["custom"] = customColorsEnabled;
+  st["bg"] = customBgRgb;
+  st["fg"] = customTextRgb;
+  st["zero"] = zeroOffset;
+  st["zeroOK"] = zeroValid;
+  st["hardware"] = "Hosyond ESP32-32E + HX711 GPIO32/25";
+  doc["activeProfile"] = activeProfile;
+  JsonArray p = doc["profiles"].to<JsonArray>();
+  for (int i = 0; i < profileCount; ++i) {
+    JsonObject v = p.add<JsonObject>();
+    v["n"] = profiles[i].name;
+    v["m"] = profiles[i].material;
+    v["e"] = profiles[i].emptyWeight;
+    v["f"] = profiles[i].fullWeight;
+    v["rgb"] = profiles[i].rgb;
+    v["price"] = profiles[i].priceKg;
+  }
+  JsonArray h = doc["history"].to<JsonArray>();
+  for (int i = 0; i < historyCount; ++i) {
+    JsonObject v = h.add<JsonObject>();
+    v["d"] = historyItems[i].date;
+    v["n"] = historyItems[i].name;
+    v["f"] = historyItems[i].filament;
+    v["u"] = historyItems[i].used;
+    v["sw"] = historyItems[i].startWeight;
+    v["ew"] = historyItems[i].endWeight;
+    v["t"] = historyItems[i].seconds;
+    v["cost"] = historyItems[i].cost;
+    v["ok"] = historyItems[i].confirmed;
+  }
+  String out;
+  serializeJsonPretty(doc, out);
+  server.sendHeader("Content-Disposition", "attachment; filename=filamentwaage-v1.0.0-backup.json");
+  server.sendHeader("Cache-Control", "no-store");
+  server.send(200, "application/json; charset=utf-8", out);
+}
+
+void restoreBackup() {
+  if (printActive || printEndPending) {
+    server.send(409, "text/plain", "Wiederherstellung waehrend eines Drucks nicht erlaubt");
+    return;
+  }
+  String body = server.arg("plain");
+  if (body.length() < 50 || body.length() > 28000) {
+    server.send(413, "text/plain", "Ungueltige oder zu grosse Backup-Datei");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, body) ||
+      doc["format"].as<String>() != "filamentwaage-backup" ||
+      !doc["settings"].is<JsonObject>() || !doc["profiles"].is<JsonArray>() ||
+      !doc["history"].is<JsonArray>()) {
+    server.send(400, "text/plain", "Dateiformat / JSON ungueltig");
+    return;
+  }
+  JsonArrayConst p = doc["profiles"].as<JsonArrayConst>();
+  JsonArrayConst h = doc["history"].as<JsonArrayConst>();
+  if (p.size() < 1 || p.size() > MAX_PROFILES || h.size() > MAX_HISTORY) {
+    server.send(400, "text/plain", "Unzulaessige Profil- oder Archivanzahl");
+    return;
+  }
+  // Erst vollstaendig in Zwischenpuffer pruefen: niemals halbimportiertes JSON uebernehmen.
+  FilamentProfile newProfiles[MAX_PROFILES];
+  PrintRecord newHistory[MAX_HISTORY];
+  for (size_t i = 0; i < p.size(); ++i) {
+    JsonObjectConst v = p[i].as<JsonObjectConst>();
+    newProfiles[i].name = v["n"].as<String>();
+    newProfiles[i].material = v["m"].as<String>();
+    newProfiles[i].emptyWeight = v["e"] | -1.0f;
+    newProfiles[i].fullWeight = v["f"] | -1.0f;
+    newProfiles[i].rgb = v["rgb"] | 0x21C5FFUL;
+    newProfiles[i].priceKg = v["price"] | -1.0f;
+    if (newProfiles[i].name.isEmpty() || newProfiles[i].name.length() > 32 ||
+        newProfiles[i].material.isEmpty() || newProfiles[i].material.length() > 12 ||
+        !isfinite(newProfiles[i].emptyWeight) || newProfiles[i].emptyWeight < 0 ||
+        newProfiles[i].emptyWeight > 5000 || !isfinite(newProfiles[i].fullWeight) ||
+        newProfiles[i].fullWeight <= 0 || newProfiles[i].fullWeight > 5000 ||
+        !isfinite(newProfiles[i].priceKg) || newProfiles[i].priceKg < 0 ||
+        newProfiles[i].priceKg > 1000) {
+      server.send(400, "text/plain", "Profil im Backup ungueltig");
+      return;
+    }
+  }
+  for (size_t i = 0; i < h.size(); ++i) {
+    JsonObjectConst v = h[i].as<JsonObjectConst>();
+    newHistory[i].date = v["d"].as<String>();
+    newHistory[i].name = v["n"].as<String>();
+    newHistory[i].filament = v["f"].as<String>();
+    newHistory[i].used = v["u"] | -1.0f;
+    newHistory[i].startWeight = v["sw"] | 0.0f;
+    newHistory[i].endWeight = v["ew"] | 0.0f;
+    newHistory[i].seconds = v["t"] | 0UL;
+    newHistory[i].cost = v["cost"] | -1.0f;
+    newHistory[i].confirmed = v["ok"] | false;
+    if (newHistory[i].date.length() > 32 || newHistory[i].name.length() > 100 ||
+        newHistory[i].filament.length() > 80 || !isfinite(newHistory[i].used) ||
+        newHistory[i].used < 0 || newHistory[i].used > 5000 ||
+        !isfinite(newHistory[i].cost) || newHistory[i].cost < 0 || newHistory[i].cost > 5000 ||
+        !isfinite(newHistory[i].startWeight) || !isfinite(newHistory[i].endWeight)) {
+      server.send(400, "text/plain", "Archiveintrag ungueltig");
+      return;
+    }
+  }
+  JsonObjectConst st = doc["settings"].as<JsonObjectConst>();
+  float newExpected = st["expected"] | -1.0f;
+  // Alte V1.8-Backups ohne Abzug behalten den aktuellen Wert bei.
+  float newDeduct = st["deduct"] | manualDeductionGrams;
+  float newLow = st["low"] | -1.0f;
+  uint8_t newBView = st["bview"] | 255;
+  uint8_t newBright = st["bright"] | 0;
+  uint8_t newTimeout = st["timeout"] | 255;
+  bool newDark = st["dark"] | true;
+  bool newNotice = st["notice"] | true;
+  uint16_t newDMask = (uint16_t)(st["dmask"] | 0xFFFF);
+  uint16_t newWMask = (uint16_t)(st["wmask"] | 0xFFFF);
+  bool newCustom = st["custom"] | false;
+  uint32_t newBg = st["bg"] | 0x080C10UL;
+  uint32_t newFg = st["fg"] | 0xFFFFFFUL;
+  int newActive = doc["activeProfile"] | -1;
+  if (!isfinite(newExpected) || newExpected < 0 || newExpected > 5000 ||
+      !isfinite(newDeduct) || newDeduct < 0 || newDeduct > 5000 ||
+      !isfinite(newLow) || newLow < 0 || newLow > 5000 ||
+      newBView > 2 || newBright < 10 || newBright > 100 || newTimeout > 4 ||
+      newDMask > 255 || newWMask > 255 ||
+      newActive < 0 || newActive >= (int)p.size() ||
+      (newCustom && !readableColors(newBg, newFg))) {
+    server.send(400, "text/plain", "Einstellungen im Backup ungueltig");
+    return;
+  }
+  bool restoreZero = server.arg("zero") == "1";
+  long newZero = st["zero"] | 0L;
+  bool newZeroValid = st["zeroOK"] | false;
+  if (restoreZero && (newZero > 8388607L || newZero < -8388608L)) {
+    server.send(400, "text/plain", "Nullpunkt ausserhalb HX711-Bereich");
+    return;
+  }
+
+  // Ab hier ist die komplette Datei plausibilisiert.
+  profileCount = (int)p.size();
+  activeProfile = newActive;
+  for (int i = 0; i < profileCount; ++i) profiles[i] = newProfiles[i];
+  historyCount = (int)h.size();
+  for (int i = 0; i < historyCount; ++i) historyItems[i] = newHistory[i];
+  saveProfiles();
+  saveHistory();
+  expectedGrams = newExpected;
+  manualDeductionGrams = newDeduct;
+  lowFilamentThreshold = newLow;
+  bambuViewMode = newBView;
+  displayBrightness = newBright;
+  displayTimeoutChoice = newTimeout;
+  displayDarkMode = newDark;
+  displayNotifications = newNotice;
+  noticeDisplayMask = newDMask;
+  noticeWebMask = newWMask;
+  customColorsEnabled = newCustom;
+  customBgRgb = newBg & 0xFFFFFFUL;
+  customTextRgb = newFg & 0xFFFFFFUL;
+  prefs.putFloat("expected", expectedGrams);
+  prefs.putFloat("wDeduct", manualDeductionGrams);
+  prefs.putUChar("bview", bambuViewMode);
+  prefs.putUChar("dBright", displayBrightness);
+  prefs.putUChar("dTime", displayTimeoutChoice);
+  prefs.putBool("dDark", displayDarkMode);
+  prefs.putBool("dNotice", displayNotifications);
+  prefs.putBool("custClr", customColorsEnabled);
+  prefs.putUInt("bgRGB", customBgRgb);
+  prefs.putUInt("txRGB", customTextRgb);
+  saveV18Settings();
+  if (restoreZero) {
+    zeroOffset = newZero;
+    zeroValid = newZeroValid;
+    prefs.putLong("zero", zeroOffset);
+    prefs.putBool("zeroOK", zeroValid);
+    filterReady = false;
+    recentCount = 0;
+    recentIndex = 0;
+    stable = false;
+    lastStableAt = 0;
+  }
+  pendingNoticeDisplayMask = noticeDisplayMask;
+  pendingNoticeWebMask = noticeWebMask;
+  pendingBrightness = displayBrightness;
+  pendingTimeoutChoice = displayTimeoutChoice;
+  pendingDarkMode = displayDarkMode;
+  pendingNotifications = displayNotifications;
+  pendingCustomColors = customColorsEnabled;
+  pendingBgRgb = customBgRgb;
+  pendingTextRgb = customTextRgb;
+  pendingBambuViewMode = bambuViewMode;
+  applyDisplayTheme();
+  setDisplayBacklight();
+  recalculateFilamentRemaining();
+  pageDirty = true;
+  logEvent("V1.0.0 Backup wiederhergestellt (Zugangsdaten unveraendert)");
+  server.send(200, "text/plain", "Wiederherstellung erfolgreich. Seite neu laden.");
+}
+
+// =====================================================
+// 39. WEBROUTEN
+// =====================================================
+
+void startWebServer() {
+  server.on("/notifications", HTTP_GET, []() {
+    if (!checkLogin()) return;
+    pageNotifications();
+  });
+  server.on("/api/notices", HTTP_GET, []() {
+    if (!checkLogin()) return;
+    pageNoticeAPI();
+  });
+  server.on("/notifications/save", HTTP_POST, []() {
+    if (!checkLogin()) return;
+    uint16_t dm = 0, wm = 0;
+    for (uint8_t i = 0; i < N_COUNT; ++i) {
+      if (server.hasArg("d" + String(i))) dm |= (1U << i);
+      if (server.hasArg("w" + String(i))) wm |= (1U << i);
+    }
+    noticeDisplayMask = dm;
+    noticeWebMask = wm;
+    pendingNoticeDisplayMask = dm;
+    pendingNoticeWebMask = wm;
+    saveV18Settings();
+    pageDirty = true;
+    logEvent("Meldungstypen fuer LCD und Browser gespeichert");
+    redirect("/notifications");
+  });
+  server.on("/warning/save", HTTP_POST, []() {
+    if (!checkLogin()) return;
+    float low = server.arg("low").toFloat();
+    if (!isfinite(low) || low < 0 || low > 5000) {
+      server.send(400, "text/plain", "Ungueltige Warnschwelle");
+      return;
+    }
+    lowFilamentThreshold = low;
+    warnedLow = false;
+    saveV18Settings();
+    redirect("/settings");
+  });
+  server.on("/backup", HTTP_GET, []() {
+    if (!checkLogin()) return;
+    downloadBackup();
+  });
+  server.on("/restore", HTTP_POST, []() {
+    if (!checkLogin()) return;
+    restoreBackup();
+  });
+  server.on("/", HTTP_GET, []() {
+    if (!checkLogin()) return;
+    pageHome();
+  });
+
+  server.on("/api", HTTP_GET, []() {
+    if (!checkLogin()) return;
+    pageAPI();
+  });
+
+  server.on("/profiles", HTTP_GET, []() {
+    if (!checkLogin()) return;
+    pageProfiles();
+  });
+
+  server.on("/profile/save", HTTP_POST, []() {
+    if (!checkLogin()) return;
+    saveProfileWeb();
+  });
+
+  server.on("/profile/select", HTTP_POST, []() {
+    if (!checkLogin()) return;
+    selectProfileWeb();
+  });
+
+  server.on("/profile/delete", HTTP_POST, []() {
+    if (!checkLogin()) return;
+    deleteProfileWeb();
+  });
+
+  server.on("/printer", HTTP_GET, []() {
+    if (!checkLogin()) return;
+    pageBambu();
+  });
+
+  server.on("/settings", HTTP_GET, []() {
+    if (!checkLogin()) return;
+    pageSettings();
+  });
+
+  server.on("/display/save", HTTP_POST, []() {
+    if (!checkLogin()) return;
+    int bright = server.arg("brightness").toInt();
+    int tm = server.arg("timeout").toInt();
+    if (bright < 10 || bright > 100 || tm < 0 || tm > 4) {
+      server.send(400, "text/plain", "Ungueltige Display-Werte");
+      return;
+    }
+    pendingBrightness = (uint8_t)bright;
+    pendingTimeoutChoice = (uint8_t)tm;
+    pendingDarkMode = server.hasArg("dark");
+    pendingNotifications = server.hasArg("notice");
+    pendingCustomColors = server.hasArg("custom");
+    if (pendingCustomColors) {
+      String bg = server.arg("bgcolor");
+      String fg = server.arg("textcolor");
+      bool validHex = bg.length() == 7 && fg.length() == 7 &&
+        bg.startsWith("#") && fg.startsWith("#");
+      if (validHex) {
+        for (uint8_t i = 1; i <= 6; ++i) {
+          if (!isxdigit((unsigned char)bg[i]) ||
+              !isxdigit((unsigned char)fg[i])) validHex = false;
+        }
+      }
+      if (!validHex) {
+        server.send(400, "text/plain", "Ungueltiger RGB-Hexwert");
+        return;
+      }
+      // Keine stillschweigende Farbersetzung bei ungueltigen Werten.
+      uint32_t bgRgb = readHexColor(bg);
+      uint32_t textRgb = readHexColor(fg);
+      if (!readableColors(bgRgb, textRgb)) {
+        server.send(400, "text/plain",
+          "Schrift und Hintergrund haben zu wenig Kontrast. Bitte hellere/dunklere Farbe waehlen.");
+        return;
+      }
+      pendingBgRgb = bgRgb;
+      pendingTextRgb = textRgb;
+    } else {
+      updatePendingColorDefaults();
+    }
+    saveDisplayPrefs();
+    redirect("/settings");
+  });
+
+  server.on("/bambu/view", HTTP_POST, []() {
+    if (!checkLogin()) return;
+    int selected = server.arg("mode").toInt();
+    if (selected < 0 || selected > 2 ||
+        (server.arg("mode") != "0" &&
+         server.arg("mode") != "1" &&
+         server.arg("mode") != "2")) {
+      server.send(400, "text/plain", "Ungueltiger Modus");
+      return;
+    }
+    bambuViewMode = (uint8_t)selected;
+    prefs.putUChar("bview", bambuViewMode);
+    logEvent("Bambu-Ansicht: " + bambuViewName(bambuViewMode));
+    pageDirty = true;
+    redirect("/settings");
+  });
+
+  server.on("/history", HTTP_GET, []() {
+    if (!checkLogin()) return;
+    pageHistory();
+  });
+
+  server.on("/history.csv", HTTP_GET, []() {
+    if (!checkLogin()) return;
+    downloadCSV();
+  });
+
+  server.on("/console", HTTP_GET, []() {
+    if (!checkLogin()) return;
+    pageConsole();
+  });
+
+  // Gewichtsabzug nur ueber die Weboberflaeche. Gespeichert im vorhandenen
+  // NVS-Namespace "fw-v13", unabhaengig vom aktiven Filamentprofil.
+  server.on("/weight/deduction", HTTP_POST, []() {
+    if (!checkLogin()) return;
+    if (!server.hasArg("deduct")) {
+      server.send(400, "text/plain", "Gramm-Abzug fehlt");
+      return;
+    }
+    String entered = server.arg("deduct");
+    entered.trim();
+    entered.replace(',', '.');
+    if (entered.isEmpty() || entered.length() > 16) {
+      server.send(400, "text/plain", "Ungueltiger Gewichtsabzug");
+      return;
+    }
+    char* end = nullptr;
+    const float value = strtof(entered.c_str(), &end);
+    if (!end || *end != '\0' || !isfinite(value) || value < 0.0f || value > 5000.0f) {
+      server.send(400, "text/plain", "Bitte 0 bis 5000 Gramm eingeben");
+      return;
+    }
+    manualDeductionGrams = value;
+    prefs.putFloat("wDeduct", manualDeductionGrams);
+    recalculateFilamentRemaining();
+    pageDirty = true;
+    logEvent("Gewichtsabzug gespeichert: " + String(manualDeductionGrams, 1) + " g");
+    redirect("/");
+  });
+
+  server.on("/estimate", HTTP_POST, []() {
+    if (!checkLogin()) return;
+
+    expectedGrams = clampFloat(
+      server.arg("grams").toFloat(),
+      0,
+      5000
+    );
+
+    prefs.putFloat(
+      "expected",
+      expectedGrams
+    );
+
+    redirect("/");
+  });
+
+  server.on("/tare", HTTP_POST, []() {
+    if (!checkLogin()) return;
+
+    if (!tareScale()) {
+      server.send(
+        503,
+        "text/plain",
+        "Tara fehlgeschlagen"
+      );
+      return;
+    }
+
+    redirect("/settings");
+  });
+
+  server.on("/print/start", HTTP_POST, []() {
+    if (!checkLogin()) return;
+    startPrint(false);
+    redirect("/");
+  });
+
+  server.on("/print/stop", HTTP_POST, []() {
+    if (!checkLogin()) return;
+    stopPrint();
+    redirect("/");
+  });
+
+  server.onNotFound([]() {
+    if (!checkLogin()) return;
+
+    server.send(
+      404,
+      "text/plain",
+      "Seite nicht gefunden"
+    );
+  });
+
+  server.begin();
+
+  logEvent(
+    "Webserver mit Login gestartet"
+  );
+}
+
+// =====================================================
+// 39A. TESTBEFEHLE (NUR BENACHRICHTIGUNGEN)
+// =====================================================
+// Diese Schnittstelle simuliert nur eine Meldung. Sie startet/stoppt
+// KEINEN echten Druck, veraendert KEINE Messwerte, Profile oder
+// Statistiken und schreibt keine neuen NVS-Einstellungen.
+// Arduino IDE -> Serieller Monitor, 115200 Baud, Zeilenende: Neue Zeile.
+// TEST ALL sendet mit Abstand: am LCD bleibt jede Meldung ca. 5 s.
+
+const char* const noticeTestWords[N_COUNT] = {
+  "LOW", "START", "END", "ERROR", "MOTION", "LOST", "RESTORED", "PAUSE"
+};
+
+bool noticeTestAllRunning = false;
+uint8_t noticeTestNext = 0;
+uint32_t noticeTestDue = 0;
+
+void showNoticeTestHelp() {
+  Serial.println(F("[TEST] Befehle (115200 Baud, Zeilenende: Neue Zeile):"));
+  Serial.println(F("  HELP"));
+  Serial.println(F("  TEST LOW / START / END / ERROR / MOTION"));
+  Serial.println(F("  TEST LOST / RESTORED / PAUSE"));
+  Serial.println(F("  TEST ALL  (alle 8 Typen nacheinander, je 5.8 s)"));
+  Serial.println(F("  TEST STOP (laufende Testreihe abbrechen)"));
+  Serial.println(F("[TEST] Kein Einfluss auf Druck, Waage oder Archiv."));
+}
+
+void sendTestNotice(NoticeType type) {
+  // Die reale Meldungsfunktion wird mit den eingestellten LCD-/Web-
+  // Masken genutzt. So laesst sich auch das Abschalten direkt testen.
+  emitNotice(type, String("TEST: ") + noticeName(type));
+  const uint16_t mask = (uint16_t)1U << (uint8_t)type;
+  Serial.print(F("[TEST] "));
+  Serial.print(noticeTestWords[(uint8_t)type]);
+  Serial.print(F(" | LCD="));
+  Serial.print(displayNotifications && (noticeDisplayMask & mask) ? F("EIN") : F("AUS"));
+  Serial.print(F(" | WEB="));
+  Serial.println((noticeWebMask & mask) ? F("EIN") : F("AUS"));
+}
+
+void processNoticeTestCommand(String command) {
+  command.trim();
+  command.toUpperCase();
+  if (!command.length()) return;
+  if (command == "HELP" || command == "?") {
+    showNoticeTestHelp();
+    return;
+  }
+  if (command == "TEST STOP") {
+    noticeTestAllRunning = false;
+    Serial.println(F("[TEST] Testreihe abgebrochen."));
+    return;
+  }
+  if (command == "TEST ALL") {
+    noticeTestAllRunning = true;
+    noticeTestNext = 1;
+    noticeTestDue = millis() + 5800UL;
+    Serial.println(F("[TEST] Testreihe gestartet; TEST STOP zum Abbrechen."));
+    sendTestNotice(N_LOW);
+    return;
+  }
+  for (uint8_t i = 0; i < N_COUNT; ++i) {
+    if (command == (String("TEST ") + noticeTestWords[i])) {
+      noticeTestAllRunning = false;
+      sendTestNotice((NoticeType)i);
+      return;
+    }
+  }
+  Serial.println(F("[TEST] Unbekannter Befehl. HELP eingeben."));
+}
+
+void serviceNoticeTestCommands() {
+  // Keine blockierenden String-Leseoperationen: MQTT, HX711 und
+  // Touch koennen parallel ohne zusaetzliche Wartezeit weiterlaufen.
+  static char input[48] = {0};
+  static uint8_t used = 0;
+  uint8_t budget = 0;
+  while (Serial.available() > 0 && budget++ < 64) {
+    char c = (char)Serial.read();
+    if (c == '\r' || c == '\n') {
+      if (used) {
+        input[used] = '\0';
+        processNoticeTestCommand(String(input));
+        used = 0;
+      }
+    } else if (c >= 32 && c <= 126) {
+      if (used < sizeof(input) - 1) {
+        input[used++] = c;
+      } else {
+        used = 0;
+        Serial.println(F("[TEST] Befehl zu lang. HELP eingeben."));
+      }
+    }
+  }
+  if (noticeTestAllRunning && (int32_t)(millis() - noticeTestDue) >= 0) {
+    if (noticeTestNext < N_COUNT) {
+      sendTestNotice((NoticeType)noticeTestNext++);
+      noticeTestDue = millis() + 5800UL;
+    }
+    if (noticeTestNext >= N_COUNT) {
+      noticeTestAllRunning = false;
+      Serial.println(F("[TEST] Testreihe abgeschlossen."));
+    }
+  }
+}
+
+// =====================================================
+// 40. SERIELLE DIAGNOSE
+// =====================================================
+
+void serialStatus() {
+  if (millis() - lastSerialStatus < 2000) {
+    return;
+  }
+
+  lastSerialStatus = millis();
+
+  Serial.print("Rohwert: ");
+  Serial.print(rawValue);
+
+  Serial.print(" | Gewicht: ");
+  Serial.print(displayedWeightGrams(), 2);
+
+  Serial.print(" g | Rest: ");
+  Serial.print(restGrams, 2);
+
+  Serial.print(" g | Prozent: ");
+  Serial.print(fillPercent, 1);
+
+  Serial.print(" | Faktor: ");
+  Serial.print(SCALE_FACTOR, 1);
+
+  Serial.print(" | Nullpunkt: ");
+  Serial.print(zeroOffset);
+
+  Serial.print(" | Stabil: ");
+  Serial.print(stable ? "JA" : "NEIN");
+
+  Serial.print(" | WLAN: ");
+  Serial.print(
+    WiFi.status() == WL_CONNECTED
+      ? "OK"
+      : "OFFLINE"
+  );
+
+  Serial.print(" | Bambu: ");
+  Serial.println(bambuState);
+}
+
+// =====================================================
+// 41. SETUP
+// =====================================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(400);
+
+  Serial.println();
+  Serial.println("===============================");
+  Serial.println("FILAMENTWAAGE V1.0.0 STARTET");
+  Serial.println("===============================");
+
+  // Gleicher Speicherbereich wie V1.4:
+  // Vorhandene Profile und Archivdaten bleiben.
+
+  prefs.begin("fw-v13", false);
+
+  expectedGrams =
+    prefs.getFloat("expected", 0);
+  // Eigener NVS-Schluessel, bestehende V1.7/V1.8-Daten unveraendert.
+  manualDeductionGrams = prefs.getFloat("wDeduct", 0.0f);
+  if (!isfinite(manualDeductionGrams) || manualDeductionGrams < 0.0f ||
+      manualDeductionGrams > 5000.0f) manualDeductionGrams = 0.0f;
+  lowFilamentThreshold = clampFloat(prefs.getFloat("lowGram", 100), 0, 5000);
+  noticeDisplayMask = (uint16_t)(prefs.getUInt("ntDMask", 0xFF) & 0xFF);
+  noticeWebMask = (uint16_t)(prefs.getUInt("ntWMask", 0xFF) & 0xFF);
+  pendingNoticeDisplayMask = noticeDisplayMask;
+  pendingNoticeWebMask = noticeWebMask;
+
+  // Standard ist BEIDES. Dieselbe Auswahl kann
+  // unter SYSTEM oder in der Weboberflaeche geaendert werden.
+  bambuViewMode = prefs.getUChar("bview", 2);
+  if (bambuViewMode > 2) bambuViewMode = 2;
+  pendingBambuViewMode = bambuViewMode;
+
+  displayBrightness = constrain((int)prefs.getUChar("dBright", 88), 10, 100);
+  displayTimeoutChoice = prefs.getUChar("dTime", 2);
+  if (displayTimeoutChoice > 4) displayTimeoutChoice = 2;
+  displayDarkMode = prefs.getBool("dDark", true);
+  displayNotifications = prefs.getBool("dNotice", true);
+  pendingBrightness = displayBrightness;
+  pendingTimeoutChoice = displayTimeoutChoice;
+  pendingDarkMode = displayDarkMode;
+  pendingNotifications = displayNotifications;
+  customColorsEnabled = prefs.getBool("custClr", false);
+  customBgRgb = prefs.getUInt("bgRGB", defaultBackgroundRgb(displayDarkMode)) & 0xFFFFFFUL;
+  customTextRgb = prefs.getUInt("txRGB", defaultTextRgb(displayDarkMode)) & 0xFFFFFFUL;
+  // Rueckfall auf Standard, falls alte/kaputte Einstellungen nicht lesbar sind.
+  if (customColorsEnabled && !readableColors(customBgRgb, customTextRgb))
+    customColorsEnabled = false;
+  pendingCustomColors = customColorsEnabled;
+  pendingBgRgb = customBgRgb;
+  pendingTextRgb = customTextRgb;
+  updatePendingColorDefaults();
+
+  loadProfiles();
+  loadHistory();
+
+  // Displaybeleuchtung
+  pinMode(TFT_LED, OUTPUT);
+  digitalWrite(TFT_LED, HIGH);
+
+  lcd.init();
+  lcd.setRotation(1);
+  lcd.setBrightness(255);
+  applyDisplayTheme();
+  lastDisplayInteraction = millis();
+  setDisplayBacklight();
+  lcd.fillScreen(BG);
+
+  txt(
+    "FILAMENTWAAGE",
+    240, 125, 3,
+    WHITE, middle_center
+  );
+
+  txt(
+    "VERSION 1.0.0",
+    240, 178, 2,
+    GREEN, middle_center
+  );
+
+  Serial.print("Display: ");
+  Serial.print(lcd.width());
+  Serial.print(" x ");
+  Serial.println(lcd.height());
+
+  // NEU V1.5:
+  // 16 Bit statt 8 Bit.
+  // RGB565-Puffer: ca. 46,8 KB.
+
+  sprite.setColorDepth(16);
+
+  spriteReady =
+    sprite.createSprite(450, 52) != nullptr;
+
+  if (spriteReady) {
+    logEvent("Display-Sprite bereit");
+  } else {
+    logEvent(
+      "WARNUNG: Sprite konnte nicht angelegt werden"
+    );
+  }
+
+  initScale();
+  connectWiFi();
+
+  // Bambu MQTT ueber TLS.
+  // WICHTIG:
+  // Zertifikat wird in dieser Testversion
+  // nicht geprueft.
+
+  tls.setInsecure();
+  tls.setTimeout(3);
+
+  mqtt.setServer(
+    "us.mqtt.bambulab.com",
+    8883
+  );
+
+  mqtt.setCallback(onBambuMessage);
+
+  mqtt.setBufferSize(8192);
+  mqtt.setKeepAlive(45);
+  mqtt.setSocketTimeout(3);
+
+  startWebServer();
+
+  pageDirty = true;
+
+  logEvent("Filamentwaage V1.0.0 bereit");
+  Serial.println(F("Serielle Meldungstests: HELP eingeben (115200 Baud)."));
+
+  logEvent(
+    "Webseite: http://" + currentIP()
+  );
+}
+
+// =====================================================
+// 42. HAUPTSCHLEIFE
+// =====================================================
+
+void loop() {
+  server.handleClient();
+
+  maintainWiFi();
+  updateScale();
+  serviceHybridFinal();
+  updateTouch();
+  maintainBambu();
+  maintainDisplayTimeout();
+  updateDisplay();
+  serialStatus();
+  serviceNoticeTestCommands();
+
+  delay(5);
+}
+
+// ================= ENDE V1.0.0 =================
